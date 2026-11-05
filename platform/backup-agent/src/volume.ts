@@ -58,6 +58,18 @@ export type MarkerForm =
 export type DirectoryClass = 'empty' | 'unencrypted' | 'xts' | 'integrity' | 'reserved' | 'corrupt';
 /** The tenant host runs as this uid (platform `workload-storage.ts` HOST_UID). */
 export const HOST_UID = 65532;
+/**
+ * A PostgreSQL data directory, as `pglite-component` lays it out and boots it (its
+ * `src/engine.rs`): `<open root>/data/` holds `PG_VERSION`, `global/pg_control` and, since #212,
+ * the `di-framework-database` marker. Only names are looked at; encfs leaves them in the clear.
+ */
+const PG_VERSION = 'PG_VERSION';
+const PG_CONTROL = 'global/pg_control';
+const DATABASE_MARKER = 'di-framework-database';
+/** `17` or `17.5`; a `PG_VERSION` that is ciphertext or anything else records null. */
+const PG_VERSION_TEXT = /^\d+(\.\d+)?$/;
+const PG_VERSION_MAX = 16;
+const DATABASES: ReadonlySet<string> = new Set(['postgres', 'template1']);
 export const ARCHIVE = 'data.tar';
 export const SUMS = 'SHA256SUMS';
 export const MANIFEST = 'manifest.json';
@@ -85,6 +97,18 @@ export interface VolumeDirectory {
   gid?: number;
 }
 
+/** A PostgreSQL data directory found in the volume (#492). */
+export interface DataDirectory {
+  /** PGDATA relative to the volume root: `<open root>/data` for pglite-component. */
+  path: string;
+  /** `PG_VERSION` and `global/pg_control` both exist, which is what pglite-component boots. */
+  complete: boolean;
+  /** The content of `PG_VERSION` in a plaintext volume; null when it is ciphertext. */
+  pgVersion: string | null;
+  /** `postgres` with the `di-framework-database` marker (#212), else the legacy `template1`. */
+  applicationDatabase: 'postgres' | 'template1';
+}
+
 export interface VolumeManifest {
   apiVersion: 'platform.di-framework.dev/v1alpha1';
   kind: 'WorkloadVolumeManifest';
@@ -104,6 +128,8 @@ export interface VolumeManifest {
   encfsMode: EncfsMode;
   /** The marker is the platform's reservation: an integrity directory encfs has not keyed yet. */
   encfsReservation: boolean;
+  /** Every PostgreSQL data directory in the volume, by path. */
+  dataDirectories: DataDirectory[];
   /** Entries not owned by the host uid; a restore gives every entry its recorded owner. */
   foreignOwners: number;
   archive: typeof ARCHIVE;
@@ -162,6 +188,48 @@ export function modeOf(found: DirectoryClass): EncfsMode | undefined {
   if (found === 'integrity' || found === 'reserved') return 'AEAD';
   if (found === 'corrupt') return undefined;
   return 'NotEncfs';
+}
+
+/**
+ * The PostgreSQL data directories in a tree, from entry names alone: a directory holding a
+ * regular `PG_VERSION` file. `readVersion` reads that file's content; pass it only for a
+ * plaintext volume, where the content is a version and not ciphertext.
+ */
+export async function dataDirectoriesOf(
+  entries: Pick<TreeEntry, 'path' | 'type' | 'size'>[],
+  readVersion?: (path: string) => Promise<Uint8Array>,
+): Promise<DataDirectory[]> {
+  const files = new Map(
+    entries.filter((entry) => entry.type === 'file').map((entry) => [entry.path, entry.size]),
+  );
+  const found: DataDirectory[] = [];
+  for (const entry of entries) {
+    const version = `${entry.path}/${PG_VERSION}`;
+    if (entry.type !== 'directory' || !files.has(version)) continue;
+    let pgVersion: string | null = null;
+    if (readVersion && (files.get(version) as number) <= PG_VERSION_MAX) {
+      const text = Buffer.from(await readVersion(version))
+        .toString('utf8')
+        .trim();
+      pgVersion = PG_VERSION_TEXT.test(text) ? text : null;
+    }
+    found.push({
+      path: entry.path,
+      complete: files.has(`${entry.path}/${PG_CONTROL}`),
+      pgVersion,
+      applicationDatabase: files.has(`${entry.path}/${DATABASE_MARKER}`) ? 'postgres' : 'template1',
+    });
+  }
+  return found.sort((a, b) => byName(a.path, b.path));
+}
+
+/** `PG_VERSION` is readable only where nothing is encrypted. */
+function versionReader(
+  io: AgentIo,
+  root: string,
+  found: DirectoryClass,
+): ((path: string) => Promise<Uint8Array>) | undefined {
+  return modeOf(found) === 'NotEncfs' ? (path) => io.readFile(`${root}/${path}`) : undefined;
 }
 
 interface MarkerState {
@@ -318,10 +386,13 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
   if (!safeKey(objectKey(request, ARCHIVE))) return fail('PvcPathInvalid');
   let before: Tree;
   let state: MarkerState;
+  let dataDirectories: DataDirectory[];
   try {
     before = await readTree(io, source);
-    state = await markerState(io, source, [...before.files, ...before.directories]);
+    const entries = [...before.files, ...before.directories];
+    state = await markerState(io, source, entries);
     if (state.found === 'corrupt') throw new VolumeError('EncfsMarkerInvalid');
+    dataDirectories = await dataDirectoriesOf(entries, versionReader(io, source, state.found));
   } catch (error) {
     return fail(error instanceof VolumeError ? error.code : 'SourceUnreadable');
   }
@@ -375,6 +446,7 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
     encfsKcv: state.kcv,
     encfsMode: modeOf(state.found) as EncfsMode,
     encfsReservation: state.found === 'reserved',
+    dataDirectories,
     foreignOwners: [...files, ...directories].filter(
       (entry) => entry.uid !== HOST_UID || entry.gid !== HOST_UID,
     ).length,
@@ -407,6 +479,7 @@ export async function backupVolume(io: AgentIo, request: AgentRequest): Promise<
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
     encfsMode: manifest.encfsMode,
+    dataDirectories: manifest.dataDirectories.length,
     ...(manifest.imageDigest ? { imageDigest: manifest.imageDigest } : {}),
   });
 }
@@ -440,7 +513,17 @@ export function parseManifest(text: string): VolumeManifest | undefined {
       ownerValid(directory.uid) &&
       ownerValid(directory.gid),
   );
-  if (!filesValid || !directoriesValid) return undefined;
+  if (!filesValid || !directoriesValid || !Array.isArray(parsed.dataDirectories)) return undefined;
+  const dataDirectoriesValid = parsed.dataDirectories.every(
+    (found) =>
+      typeof found?.path === 'string' &&
+      safeKey(found.path) &&
+      typeof found.complete === 'boolean' &&
+      (found.pgVersion === null ||
+        (typeof found.pgVersion === 'string' && PG_VERSION_TEXT.test(found.pgVersion))) &&
+      DATABASES.has(String(found.applicationDatabase)),
+  );
+  if (!dataDirectoriesValid) return undefined;
   if (parsed.encfsKcv !== null && !/^[0-9a-f]{32}$/.test(String(parsed.encfsKcv))) return undefined;
   if (!ENCFS_MODES.has(String(parsed.encfsMode))) return undefined;
   if (typeof parsed.encfsReservation !== 'boolean') return undefined;
@@ -448,6 +531,15 @@ export function parseManifest(text: string): VolumeManifest | undefined {
   const keyed = parsed.encfsMode !== 'NotEncfs' && !parsed.encfsReservation;
   if (keyed !== (parsed.encfsKcv !== null)) return undefined;
   if (parsed.encfsReservation && parsed.encfsMode !== 'AEAD') return undefined;
+  // Canonical field order, so a restore can compare the record with what it extracted.
+  parsed.dataDirectories = parsed.dataDirectories.map(
+    ({ path, complete, pgVersion, applicationDatabase }) => ({
+      path,
+      complete,
+      pgVersion,
+      applicationDatabase,
+    }),
+  );
   return parsed as VolumeManifest;
 }
 
@@ -532,6 +624,14 @@ async function verify(
   if (modeOf(state.found) !== manifest.encfsMode) return 'ModeMismatch';
   if ((state.found === 'reserved') !== manifest.encfsReservation) return 'ModeMismatch';
   if (state.kcv !== manifest.encfsKcv) return 'KcvMismatch';
+  // The record of data directories must describe the tree that was extracted (#492).
+  const dataDirectories = await dataDirectoriesOf(
+    [...tree.files, ...tree.directories],
+    versionReader(io, root, state.found),
+  ).catch(() => undefined);
+  if (JSON.stringify(dataDirectories) !== JSON.stringify(manifest.dataDirectories)) {
+    return 'ContentMismatch';
+  }
   return undefined;
 }
 
@@ -665,6 +765,7 @@ export async function restoreVolume(io: AgentIo, request: AgentRequest): Promise
     fileCount: manifest.fileCount,
     ...(manifest.encfsKcv ? { encfsKcv: manifest.encfsKcv } : {}),
     encfsMode: manifest.encfsMode,
+    dataDirectories: manifest.dataDirectories.length,
     ...(replacedPath ? { replacedPath: relative(replacedPath) } : {}),
   });
 }
