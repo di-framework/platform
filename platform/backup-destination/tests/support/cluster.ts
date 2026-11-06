@@ -354,6 +354,31 @@ export class Cluster {
         destinations: world.destinations?.map(update),
         destination: world.destination && update(world.destination),
       };
+    } else if (action.type === 'annotate') {
+      const update = (item: DestinationView) =>
+        item.name === action.name
+          ? { ...item, annotations: { ...item.annotations, [action.key]: action.value } }
+          : item;
+      this.world = {
+        ...world,
+        destinations: world.destinations?.map(update),
+        destination: world.destination && update(world.destination),
+      };
+    } else if (action.type === 'clear-annotation') {
+      const update = (item: DestinationView) =>
+        item.name === action.name
+          ? {
+              ...item,
+              annotations: Object.fromEntries(
+                Object.entries(item.annotations).filter(([key]) => key !== action.key),
+              ),
+            }
+          : item;
+      this.world = {
+        ...world,
+        destinations: world.destinations?.map(update),
+        destination: world.destination && update(world.destination),
+      };
     }
   }
 

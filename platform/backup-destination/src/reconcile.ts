@@ -30,12 +30,15 @@ import { isDue, validCron } from './schedule.ts';
 import {
   activeVolumeOps,
   advanceVolumes,
+  backupInFlight,
   backupKeys,
   expiredSources,
   releaseOrphans,
+  requestBackup,
   scheduleSources,
   sourceRows,
   startNext,
+  volumeStateKnown,
 } from './workload.ts';
 
 interface Result {
@@ -120,6 +123,54 @@ function order(type: ServiceView['type']): number {
 function enrolled(world: World): ServiceView[] {
   return [...world.services].sort(
     (a, b) => order(a.type) - order(b.type) || a.name.localeCompare(b.name),
+  );
+}
+
+function serviceReadyForBackup(service: ServiceView): boolean {
+  if (service.deleting || !service.ready || service.suspended) return false;
+  const size = parseBytes(service.storage);
+  return size === undefined || size <= DUMP_CAP_BYTES;
+}
+
+/** Whether workload-volume state failed to load this tick (#657). */
+function volumeReadFailed(world: World, hasVolumeSources: boolean): boolean {
+  if (!hasVolumeSources) return false;
+  if ('volumes' in world && (world as { volumes?: unknown }).volumes === undefined) return true;
+  return !volumeStateKnown(world);
+}
+
+/**
+ * Whether an on-demand workload-volume backup is already in flight or was already created for
+ * this `backup-now` request (#657).
+ */
+function backupAlreadyCreated(
+  world: World,
+  actions: Action[],
+  workloadName: string,
+  forced: string,
+): boolean {
+  if (backupInFlight(world, workloadName)) return true;
+  const unix = Math.floor(new Date(world.now).getTime() / 1000);
+  const forcedUnix = Math.floor(new Date(forced).getTime() / 1000);
+  const names = new Set([
+    jobName('di-volume', workloadName, unix),
+    ...(Number.isNaN(forcedUnix) ? [] : [jobName('di-volume', workloadName, forcedUnix)]),
+  ]);
+  if (
+    world.backups.some(
+      (item) =>
+        item.source?.workloadName === workloadName &&
+        !item.deleting &&
+        (names.has(item.name) || (!Number.isNaN(forcedUnix) && item.createdAt > forced)),
+    )
+  ) {
+    return true;
+  }
+  return actions.some(
+    (action) =>
+      action.type === 'create-backup' &&
+      (action.body.spec as { source?: { workloadName?: string } } | undefined)?.source
+        ?.workloadName === workloadName,
   );
 }
 
@@ -580,13 +631,31 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
   // No default schedule (#250): without one, only on-demand backups run.
   const schedule = scheduleOf(dest);
   const forced = dest.annotations[BACKUP_NOW];
-  const due =
-    (!!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now))) ||
-    (!!forced && (!status.lastAttemptTime || forced > status.lastAttemptTime));
+  const volumeSources = (dest.spec.sources ?? []).filter((source) => !source.suspend);
   const services = enrolled(world);
-  if (due) status = { ...status, lastAttemptTime: world.now, skipped: 0 };
+  const hasReadyServices = services.some(serviceReadyForBackup);
+  const holdForced = !!forced && volumeReadFailed(world, volumeSources.length > 0);
+  const serviceForcedDue =
+    !!forced && hasReadyServices && (!status.lastAttemptTime || forced > status.lastAttemptTime);
+  const cronDue = !!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now));
+  const serviceDue = cronDue || serviceForcedDue;
+  let volumeForcedRequested = false;
+  if (forced && !holdForced) {
+    for (const source of volumeSources) {
+      if (!backupAlreadyCreated(world, actions, source.workloadName, forced)) {
+        actions.push(requestBackup(world, dest, source.workloadName));
+        volumeForcedRequested = true;
+      }
+    }
+    actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
+  } else if (forced && serviceForcedDue && forced > world.now) {
+    actions.push({ type: 'annotate', name: dest.name, key: BACKUP_NOW, value: world.now });
+  }
+  const runDue = serviceDue || (volumeForcedRequested && !hasReadyServices);
+  if (runDue) {
+    status = { ...status, lastAttemptTime: world.now, ...(serviceDue ? { skipped: 0 } : {}) };
+  }
   const run = status.lastAttemptTime;
-  if (forced && due) actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
   let skipped = status.skipped ?? 0;
   const pending: ServiceView[] = [];
   for (const service of services) {
