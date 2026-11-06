@@ -97,7 +97,7 @@ The PR is opened with the `BOT_PR_TOKEN` repository secret, so its checks start 
 published:
 
 ```yaml
-image: ghcr.io/di-framework/tenant-auth@sha256:5638054919a8d00358ab4c4135c788578a091f58f8f33f27b668de74f839e655
+image: ghcr.io/di-framework/tenant-auth@sha256:bd3645638cf5d15bf31315b37db554f1c1b346a0c6f81657a867209e48bdd78a
 ```
 
 Publishing needs the organization to allow Actions to write packages (issue #13).
@@ -141,7 +141,7 @@ controller point at it with platform config:
 
 ```yaml
 tenantAuth:
-  image: ghcr.io/di-framework/tenant-auth@sha256:5638054919a8d00358ab4c4135c788578a091f58f8f33f27b668de74f839e655
+  image: ghcr.io/di-framework/tenant-auth@sha256:bd3645638cf5d15bf31315b37db554f1c1b346a0c6f81657a867209e48bdd78a
   issuer: http://identity.identity.localhost:28280
   issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80
   issuerUpstreamPodPort: 8080
