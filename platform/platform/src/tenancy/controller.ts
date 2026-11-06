@@ -1089,7 +1089,9 @@ export class Controller {
    * What {@link tenantAuthResources} needs from the cluster: the tenant's members (from
    * the User CRs, so a membership change re-renders the TokenRequest `resourceNames` on the next
    * reconcile), the API server endpoints, the controller certificate (kept until 30 days before
-   * it expires) and the tenant's own OAuth clients ({@link tenantOAuthClients}).
+   * it expires) and the host pull token. The OAuth clients ({@link tenantOAuthClients}) are
+   * resolved separately so an unreachable identity server never prevents applying the CA, leaf TLS
+   * Secret and registry pull Secret the tenant hosts mount (#673).
    */
   private async tenantAuthInputs(
     tenant: Tenant,
@@ -1112,7 +1114,6 @@ export class Controller {
       members,
       apiServer,
       tls,
-      oauthClients: await this.tenantOAuthClients(tenant, fetched),
       ...(auth.registry ? { hostPullToken: await this.hostPullToken(name) } : {}),
     };
   }
@@ -2158,13 +2159,22 @@ export class Controller {
       const legacyApiKeys = !apiKeys.done;
       const registry = await this.registryState(tenant);
       const registryNats = await this.registryNats(tenant);
+      const inputs = await this.tenantAuthInputs(
+        tenant,
+        users ??
+          (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
+        fetched,
+      );
+      let oauthClients: TenantAuthInputs['oauthClients'];
+      let oauthError: unknown;
+      try {
+        oauthClients = await this.tenantOAuthClients(tenant, fetched);
+      } catch (error) {
+        oauthError = error;
+      }
       const desired = tenantAuthResources(tenant, this.cfg, {
-        ...(await this.tenantAuthInputs(
-          tenant,
-          users ??
-            (await this.list<User>(VERSION, 'User', { [INSTALLATION]: this.cfg.installation })),
-          fetched,
-        )),
+        ...inputs,
+        ...(oauthClients ? { oauthClients } : {}),
         registryServing: registry.serving,
         registryNats: Controller.registryNatsMode(registryNats),
         legacyApiKeys,
@@ -2256,6 +2266,7 @@ export class Controller {
         legacyCaKey.metadata.labels[OWNER] === tenant.metadata.uid
       )
         await this.remove(legacyCaKey);
+      if (oauthError) throw oauthError;
       const { problems } = tenantAuthRoutes(this.cfg.tenantAuth, this.cfg.routeUrlPattern);
       if (problems.length) return condition(false, 'RouteError', problems.join('; '));
       if (registry.conflict)
