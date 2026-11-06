@@ -1640,8 +1640,8 @@ describe('projection keys per deployment and env (#106)', () => {
     // The kept ConfigMap is rewritten in the same pass, after the takeover, by server-side
     // apply: the prod line now lives in di-logs-web.prod only.
     expect(api.writes).toEqual([
-      'di-logs-web.prod?fieldManager=di-platform-controller',
-      'di-logs-web?fieldManager=di-platform-controller',
+      'di-logs-web.prod?fieldManager=di-platform-controller&force=true',
+      'di-logs-web?fieldManager=di-platform-controller&force=true',
     ]);
     expect(projectedRing(api.configMaps.get('di-logs-web'))).toEqual([
       { line: '2026-10-01T10:00:02.000000Z INFO cli up', deployment: 'web', env: '' },

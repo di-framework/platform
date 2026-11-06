@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { APPLY_RESYNC_INTERVAL_MS, Controller, collection } from '../src/tenancy/controller';
+import {
+  APPLY_RESYNC_INTERVAL_MS,
+  ApiError,
+  Controller,
+  collection,
+} from '../src/tenancy/controller';
 import type { Resource } from '../src/tenancy/resources';
-import { cfg, MemoryApi, prepare, START, stored } from './support/controller-harness';
+import { cfg, condition, MemoryApi, prepare, START, stored } from './support/controller-harness';
 
 // #643: a steady-state tick re-sent every managed object as a server-side apply (about 1,800
 // non-GET requests a minute with 8 tenants). The controller now skips an apply whose rendered body
@@ -183,5 +188,60 @@ describe('apply cache (#643)', () => {
     api.seed(alpha);
     await tick();
     expect(api.applies().length).toBeGreaterThan(20);
+  });
+
+  it('passes fieldManager=di-platform-controller&force=true on server-side apply after ownership verification (#660)', async () => {
+    const clock = { now: START };
+    const { api, tick } = await settle(clock);
+    const applyUrls = () =>
+      api.operations
+        .filter(
+          (o, i) => o.method === 'PATCH' && api.contentTypes[i] === 'application/apply-patch+yaml',
+        )
+        .map((o) => o.path);
+    expect(applyUrls().length).toBeGreaterThan(20);
+    for (const url of applyUrls())
+      expect(url.split('?')[1]).toBe('fieldManager=di-platform-controller&force=true');
+    await tick();
+
+    // A foreign fieldManager (e.g. kubectl-label) claims a controller-declared label on an owned
+    // object; the API server rejects server-side apply unless force=true is present.
+    handEdit(api, rolePath);
+    const call = api.call.bind(api);
+    api.call = async <T>(
+      method: string,
+      path: string,
+      body?: unknown,
+      contentType?: string,
+    ): Promise<T> => {
+      if (
+        method === 'PATCH' &&
+        contentType === 'application/apply-patch+yaml' &&
+        new URL(path, 'https://kubernetes').searchParams.get('force') !== 'true'
+      ) {
+        throw new ApiError(
+          409,
+          `PATCH ${path} returned 409: kubectl-label: .metadata.labels.platform.di-framework.dev/component`,
+        );
+      }
+      return call<T>(method, path, body, contentType);
+    };
+    await tick();
+    expect(applyUrls()).toEqual([`${rolePath}?fieldManager=di-platform-controller&force=true`]);
+    expect(condition(api, 'Ready')?.reason).not.toBe('ReconcileError');
+
+    // Unowned objects are still refused by the pre-apply GET check before any PATCH is sent.
+    api.seed({
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'Role',
+      metadata: { name: 'di-developer', namespace: 'di-tenant-alpha' },
+    });
+    await tick();
+    expect(condition(api, 'Ready')).toMatchObject({
+      status: 'False',
+      reason: 'ReconcileError',
+      message: 'Refusing to adopt Role di-tenant-alpha/di-developer',
+    });
+    expect(applyUrls().filter((u) => u.startsWith(rolePath))).toEqual([]);
   });
 });
