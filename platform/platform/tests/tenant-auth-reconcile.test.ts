@@ -19,6 +19,7 @@ import {
   withHostPullFailure,
 } from '../src/tenancy/controller';
 import { CONTROLLER_SCRIPT_MODULES, controllerClusterRoleRules } from '../src/tenancy/install';
+import { type OAuthClientRegistry, oauthAdminError } from '../src/tenancy/oauth-clients';
 import {
   addQuantity,
   assertTenantAuthConfig,
@@ -4033,5 +4034,176 @@ describe('tenant hosts TLS front (#113:https-hop)', () => {
     await silently(() => new Controller(api, cfg).reconcileTenant(t, []));
     expect(front(host(api))).toBeUndefined();
     expect(digestOf(host(api))).toBeUndefined();
+  });
+});
+
+describe('controller error log throttling (#663)', () => {
+  const hostPath = path('Deployment', 'di-runtime-alpha', 'hostgroup-tenant-alpha');
+  const nsPath = `${collection('v1', 'Namespace')}/di-tenant-alpha`;
+  const tenantPath = `${collection(VERSION, 'Tenant')}/alpha`;
+  const condition = (t: Tenant, type: string) => t.status?.conditions?.find((c) => c.type === type);
+
+  async function captureErrors(run: () => Promise<void>): Promise<string[]> {
+    const logged: string[] = [];
+    const saved = console.error;
+    console.error = (message: string) => logged.push(message);
+    try {
+      await run();
+    } finally {
+      console.error = saved;
+    }
+    return logged;
+  }
+
+  it('logs OAuthClientError once across repeated ticks, logs changes, and logs again after recovery or deletion', async () => {
+    const { api, t } = prepare();
+    const fake = new FakeIdentityAdmin();
+    const inner = fake.registry();
+    let oauthFailure: Error | undefined = oauthAdminError(
+      503,
+      'GET /api/admin/oauth-clients: HTTP 503',
+    );
+    const registry: OAuthClientRegistry = {
+      ...inner,
+      get: (id) => {
+        if (oauthFailure) throw oauthFailure;
+        return inner.get(id);
+      },
+    };
+    const controller = new BaseController(api, cfg, undefined, undefined, registry);
+
+    // 1. Repeated ticks with the same OAuthClientError log only on the first tick.
+    const first = await captureErrors(async () => {
+      for (let i = 0; i < 3; i++) await controller.reconcileTenant(t, []);
+    });
+    expect(first).toEqual(['Tenant/alpha tenant-auth: GET /api/admin/oauth-clients: HTTP 503']);
+    expect(condition(t, 'TenantAuthReady')).toMatchObject({
+      status: 'False',
+      reason: 'OAuthClientError',
+      message: 'GET /api/admin/oauth-clients: HTTP 503',
+    });
+
+    // 2. Changing the error message/reason emits a new console.error line once.
+    oauthFailure = oauthAdminError(
+      401,
+      'POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    );
+    const changed = await captureErrors(async () => {
+      for (let i = 0; i < 3; i++) await controller.reconcileTenant(t, []);
+    });
+    expect(changed).toEqual([
+      'Tenant/alpha tenant-auth: POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    ]);
+    expect(condition(t, 'TenantAuthReady')).toMatchObject({
+      status: 'False',
+      reason: 'OAuthClientError',
+      message: 'POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    });
+
+    // 3. Recovery (TenantAuthReady=True) clears the throttle state so a subsequent error logs again.
+    oauthFailure = undefined;
+    await controller.reconcileTenant(t, []);
+    expect(condition(t, 'TenantAuthReady')).toMatchObject({
+      status: 'True',
+      reason: 'Reconciled',
+    });
+    oauthFailure = oauthAdminError(
+      401,
+      'POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    );
+    const afterRecovery = await captureErrors(async () => {
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+    });
+    expect(afterRecovery).toEqual([
+      'Tenant/alpha tenant-auth: POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    ]);
+
+    // 4. Tenant deletion (deletionTimestamp and forgetTenants on tick) cleans up the throttle state.
+    t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    await controller.reconcileTenant(t, []);
+    delete t.metadata.deletionTimestamp;
+    const afterDeletionTimestamp = await captureErrors(async () => {
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+    });
+    expect(afterDeletionTimestamp).toEqual([
+      'Tenant/alpha tenant-auth: POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    ]);
+
+    api.objects.delete(tenantPath);
+    await captureErrors(() => controller.tick());
+    const afterForget = await captureErrors(() => controller.reconcileTenant(t, []));
+    expect(afterForget).toEqual([
+      'Tenant/alpha tenant-auth: POST http://identity.alpha.localhost:28180/oauth2/token: HTTP 401',
+    ]);
+  });
+
+  it('logs apply-conflict and reconcile errors once across repeated ticks, logs changes, and logs again after recovery or deletion', async () => {
+    const { api, controller, t } = prepare();
+    const conflict1 = `PATCH ${hostPath} returned 409: kubectl-edit: .spec.replicas`;
+    const conflict2 = `PATCH ${hostPath} returned 409: helm: .metadata.labels`;
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.startsWith(hostPath) ? new ApiError(409, conflict1) : undefined;
+
+    // 1. Repeated ticks with the same 409 apply conflict log only on the first tick.
+    const first = await captureErrors(async () => {
+      for (let i = 0; i < 3; i++) await controller.reconcileTenant(t, []);
+    });
+    expect(first).toEqual([`Tenant/alpha: ${conflict1}`]);
+    expect(condition(t, 'Ready')).toMatchObject({
+      status: 'False',
+      reason: 'ReconcileError',
+      message: conflict1,
+    });
+
+    // 2. Changing the conflict message emits a new console.error line once.
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.startsWith(hostPath) ? new ApiError(409, conflict2) : undefined;
+    const changed = await captureErrors(async () => {
+      for (let i = 0; i < 3; i++) await controller.reconcileTenant(t, []);
+    });
+    expect(changed).toEqual([`Tenant/alpha: ${conflict2}`]);
+    expect(condition(t, 'Ready')).toMatchObject({
+      status: 'False',
+      reason: 'ReconcileError',
+      message: conflict2,
+    });
+
+    // 3. Recovery (Ready=True) clears the throttle state so a subsequent conflict logs again.
+    api.fail = undefined;
+    await controller.reconcileTenant(t, []);
+    expect(condition(t, 'Ready')).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.startsWith(hostPath) ? new ApiError(409, conflict2) : undefined;
+    const afterRecovery = await captureErrors(async () => {
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+    });
+    expect(afterRecovery).toEqual([`Tenant/alpha: ${conflict2}`]);
+
+    // 4. Tenant deletion (deletionTimestamp and forgetTenants on tick) cleans up the throttle state.
+    api.fail = undefined;
+    t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    await controller.reconcileTenant(t, []);
+    delete t.metadata.deletionTimestamp;
+    // Also cover the outer tick() catch path (e.g. a conflict on Namespace apply) and forgetTenants.
+    const nsConflict = `PATCH ${nsPath} returned 409: foreign-manager: .metadata.labels`;
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.startsWith(nsPath) ? new ApiError(409, nsConflict) : undefined;
+    const tickErrors = await captureErrors(async () => {
+      await controller.tick();
+      await controller.tick();
+    });
+    expect(tickErrors.filter((line) => line.startsWith('Tenant/alpha:'))).toEqual([
+      `Tenant/alpha: ${nsConflict}`,
+    ]);
+    api.objects.delete(tenantPath);
+    await captureErrors(() => controller.tick());
+    api.seed(t);
+    const afterForget = await captureErrors(() => controller.tick());
+    expect(afterForget.filter((line) => line.startsWith('Tenant/alpha:'))).toEqual([
+      `Tenant/alpha: ${nsConflict}`,
+    ]);
   });
 });
