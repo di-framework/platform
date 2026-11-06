@@ -222,21 +222,31 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
       volumeWorld({
         destination: {
           ...dest,
-          status: { lastAttemptTime: '2026-10-13T03:30:00.000Z' },
+          status: {
+            lastAttemptTime: '2026-10-13T03:30:00.000Z',
+            services: [
+              { name: 'orders', type: 'postgres', lastAttemptTime: '2026-10-13T03:30:00.000Z' },
+            ],
+          },
           annotations: { [BACKUP_NOW]: '2026-10-13T03:29:00.000Z' },
         },
+        services: [orders],
       }),
     );
-    expect(createdBackups(stale)).toEqual([]);
+    expect(createdBackups(stale)).toEqual([`di-volume-identity-${Date.parse(NOW) / 1000}`]);
     expect(stale).toContainEqual({ type: 'clear-annotation', name: 'pvc', key: BACKUP_NOW });
 
     const exactSameStamp = reconcile(
       volumeWorld({
         destination: {
           ...dest,
-          status: { lastAttemptTime: NOW },
+          status: {
+            lastAttemptTime: NOW,
+            services: [{ name: 'orders', type: 'postgres', lastAttemptTime: NOW }],
+          },
           annotations: { [BACKUP_NOW]: NOW },
         },
+        services: [orders],
         backups: [
           {
             name: `di-volume-identity-${Date.parse(NOW) / 1000}`,
@@ -262,8 +272,19 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
       annotations: { [BACKUP_NOW]: 'true' },
     };
     expect(
-      createdBackups(reconcile(volumeWorld({ destination: tokenDest, destinations: [tokenDest] }))),
-    ).toHaveLength(1);
+      createdBackups(
+        reconcile(
+          volumeWorld({
+            destination: tokenDest,
+            destinations: [tokenDest],
+            services: [orders],
+          }),
+        ),
+      ),
+    ).toEqual([
+      `di-volume-identity-${Date.parse(NOW) / 1000}`,
+      `di-backup-orders-${Date.parse(NOW) / 1000}`,
+    ]);
 
     const tokenAlreadyAttempted = {
       ...dest,
@@ -279,6 +300,21 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
           volumeWorld({
             destination: tokenAlreadyAttempted,
             destinations: [tokenAlreadyAttempted],
+            services: [orders],
+            backups: [
+              {
+                name: `di-volume-identity-${Date.parse(NOW) / 1000}`,
+                serviceName: 'identity',
+                destinationName: 'pvc',
+                uid: 'uid-identity',
+                type: 'workload-volume',
+                className: '',
+                storage: '1Gi',
+                createdAt: NOW,
+                phase: 'Succeeded',
+                source: { kind: 'workload-volume', workloadName: 'identity' },
+              },
+            ],
           }),
         ),
       ),
@@ -411,5 +447,102 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
       key: BACKUP_NOW,
     });
     expect(statusFrom(actions)?.lastAttemptTime).toBe(NOW);
+  });
+
+  test('does not block BackingService on-demand or cron dumps when volume state is unreadable while backup-now is held', () => {
+    const dest = {
+      ...pvcDestination({
+        schedule: '30 3 * * *',
+        sources: [{ kind: 'workload-volume', workloadName: 'identity', schedule: 'none' }],
+      }),
+      status: { lastAttemptTime: '2026-10-13T01:00:00.000Z' },
+      annotations: { [BACKUP_NOW]: '2026-10-13T03:29:55.000Z' },
+    };
+
+    // Tick 1: volume state is unreadable (`volumes: undefined` / missing RBAC).
+    // BackingService dump still runs and advances lastAttemptTime, while backup-now is held for the volume.
+    const tick1World = {
+      ...volumeWorld({
+        destination: dest,
+        destinations: [dest],
+        services: [orders],
+        workloads: undefined,
+        ledger: undefined,
+      }),
+      volumes: undefined,
+    } as World;
+    const tick1 = reconcile(tick1World);
+    expect(createdBackups(tick1)).toEqual([`di-backup-orders-${Date.parse(NOW) / 1000}`]);
+    expect(tick1.some((action) => action.type === 'clear-annotation')).toBe(false);
+    const status1 = statusFrom(tick1);
+    expect(status1?.lastAttemptTime).toBe(NOW);
+
+    // Tick 1b: if volume state remains unreadable on subsequent tick after the service dump finished,
+    // the service is not re-dumped for the same backup-now, and backup-now remains held.
+    const afterDumpDest = {
+      ...dest,
+      status: {
+        ...status1,
+        services: [
+          {
+            name: 'orders',
+            type: 'postgres',
+            lastAttemptTime: NOW,
+            lastBackupName: `di-backup-orders-${Date.parse(NOW) / 1000}`,
+            lastReason: 'Completed',
+            lastSuccessTime: NOW,
+          },
+        ],
+      },
+    };
+    const tick1b = reconcile({
+      ...volumeWorld({
+        destination: afterDumpDest,
+        destinations: [afterDumpDest],
+        services: [orders],
+        workloads: undefined,
+        ledger: undefined,
+      }),
+      volumes: undefined,
+    } as World);
+    expect(createdBackups(tick1b)).toEqual([]);
+    expect(tick1b.some((action) => action.type === 'clear-annotation')).toBe(false);
+
+    // Scheduled cron dumps also continue to run when due even while backup-now is held by missing volume RBAC.
+    const nextCronNow = '2026-10-14T03:30:05.000Z';
+    const cronWhileHeld = reconcile({
+      ...volumeWorld({
+        now: nextCronNow,
+        destination: afterDumpDest,
+        destinations: [afterDumpDest],
+        services: [orders],
+        workloads: undefined,
+        ledger: undefined,
+      }),
+      volumes: undefined,
+    } as World);
+    expect(createdBackups(cronWhileHeld)).toEqual([
+      `di-backup-orders-${Date.parse(nextCronNow) / 1000}`,
+    ]);
+    expect(cronWhileHeld.some((action) => action.type === 'clear-annotation')).toBe(false);
+
+    // Tick 2: when volume state becomes readable, the held backup-now creates the workload-volume Backup
+    // without re-dumping the BackingService, and clears backup-now.
+    const tick2Now = '2026-10-13T03:30:10.000Z';
+    const tick2 = reconcile(
+      volumeWorld({
+        now: tick2Now,
+        destination: afterDumpDest,
+        destinations: [afterDumpDest],
+        services: [orders],
+      }),
+    );
+    expect(createdBackups(tick2)).toEqual([`di-volume-identity-${Date.parse(tick2Now) / 1000}`]);
+    expect(tick2).toContainEqual({
+      type: 'clear-annotation',
+      name: 'pvc',
+      key: BACKUP_NOW,
+    });
+    expect(statusFrom(tick2)?.lastAttemptTime).toBe(tick2Now);
   });
 });
