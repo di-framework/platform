@@ -159,12 +159,11 @@ fn scan() {
 /// `stat-at` on every relation file of every database, through this
 /// component's own filesystem imports (5.3). Three passes by path:
 /// `cold`, with no state anywhere; `miss`, the same again while nobody
-/// holds the files open, so every call is a full miss (open, the
-/// header-and-records read, the last-pair read; the state is dropped with
-/// the temporary descriptor); and `warm`, with the files held open and
-/// stat'ed once through their descriptors first, so their state is filed
-/// as it is for the segments PostgreSQL has open. The opens are batched
-/// under the host's descriptor limit.
+/// holds the files open (hitting the closed-file size cache of #654);
+/// and `warm`, with the files held open and stat'ed once through their
+/// descriptors first, so their state is filed as it is for the segments
+/// PostgreSQL has open. The opens are batched under the host's descriptor
+/// limit.
 fn stat() {
     let mut files: Vec<PathBuf> = Vec::new();
     for database in std::fs::read_dir(format!("{ROOT}/data/base")).expect("base") {

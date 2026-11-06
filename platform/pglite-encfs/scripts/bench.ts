@@ -9,7 +9,8 @@
  *   bulk   200k rows of about 240 bytes, then CHECKPOINT
  *   scan   a fresh engine opening the directory and scanning the bulk table
  *   stat   `stat-at` on every relation file: cold, repeated while nobody holds
- *          the file open (a miss each time), and warm with the file held open
+ *          the file open (closed-file size cache, #654), and warm with the file
+ *          held open
  *
  * PGLITE_ENCFS_BENCH_PHASES=init,stat (for example) re-runs only those rows.
  *
