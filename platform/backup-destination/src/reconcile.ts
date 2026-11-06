@@ -174,20 +174,6 @@ function backupAlreadyCreated(
   );
 }
 
-function serviceForcedAlreadyAttempted(
-  world: World,
-  dest: DestinationView,
-  forced: string,
-  holdForced: boolean,
-): boolean {
-  const last = dest.status.lastAttemptTime;
-  if (!last) return false;
-  const iso = /^\d{4}-\d{2}-\d{2}T/.test(forced);
-  if (iso && last > forced) return true;
-  const matched = (!iso && holdForced) || last === forced || last === world.now;
-  return matched && (dest.status.services ?? []).some((row) => row.lastAttemptTime === last);
-}
-
 function twoCopy(kind: string): boolean {
   return kind === 'nats' || kind === 'restore-nats' || kind === 'restore-redis';
 }
@@ -650,7 +636,7 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
   const hasReadyServices = services.some(serviceReadyForBackup);
   const holdForced = !!forced && volumeReadFailed(world, volumeSources.length > 0);
   const serviceForcedDue =
-    !!forced && hasReadyServices && !serviceForcedAlreadyAttempted(world, dest, forced, holdForced);
+    !!forced && hasReadyServices && (!status.lastAttemptTime || forced > status.lastAttemptTime);
   const cronDue = !!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now));
   const serviceDue = cronDue || serviceForcedDue;
   let volumeForcedRequested = false;
@@ -662,6 +648,8 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
       }
     }
     actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
+  } else if (forced && serviceForcedDue && forced > world.now) {
+    actions.push({ type: 'annotate', name: dest.name, key: BACKUP_NOW, value: world.now });
   }
   const runDue = serviceDue || (volumeForcedRequested && !hasReadyServices);
   if (runDue) {

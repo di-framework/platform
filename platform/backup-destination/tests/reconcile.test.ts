@@ -265,60 +265,28 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
     );
     expect(createdBackups(exactSameStamp)).toEqual([]);
 
-    // 5. Non-ISO backup-now value (e.g. "true"): triggers when lastAttemptTime !== now, skips when already attempted at now.
+    // 5. Non-ISO backup-now value (e.g. "true") triggers both volume and service backups and clears the annotation.
     const tokenDest = {
       ...dest,
       status: { lastAttemptTime: '2026-10-13T02:00:00.000Z' },
       annotations: { [BACKUP_NOW]: 'true' },
     };
-    expect(
-      createdBackups(
-        reconcile(
-          volumeWorld({
-            destination: tokenDest,
-            destinations: [tokenDest],
-            services: [orders],
-          }),
-        ),
-      ),
-    ).toEqual([
+    const tokenActions = reconcile(
+      volumeWorld({
+        destination: tokenDest,
+        destinations: [tokenDest],
+        services: [orders],
+      }),
+    );
+    expect(createdBackups(tokenActions)).toEqual([
       `di-volume-identity-${Date.parse(NOW) / 1000}`,
       `di-backup-orders-${Date.parse(NOW) / 1000}`,
     ]);
-
-    const tokenAlreadyAttempted = {
-      ...dest,
-      status: {
-        lastAttemptTime: NOW,
-        services: [{ name: 'orders', type: 'postgres', lastAttemptTime: NOW }],
-      },
-      annotations: { [BACKUP_NOW]: 'true' },
-    };
-    expect(
-      createdBackups(
-        reconcile(
-          volumeWorld({
-            destination: tokenAlreadyAttempted,
-            destinations: [tokenAlreadyAttempted],
-            services: [orders],
-            backups: [
-              {
-                name: `di-volume-identity-${Date.parse(NOW) / 1000}`,
-                serviceName: 'identity',
-                destinationName: 'pvc',
-                uid: 'uid-identity',
-                type: 'workload-volume',
-                className: '',
-                storage: '1Gi',
-                createdAt: NOW,
-                phase: 'Succeeded',
-                source: { kind: 'workload-volume', workloadName: 'identity' },
-              },
-            ],
-          }),
-        ),
-      ),
-    ).toEqual([]);
+    expect(tokenActions).toContainEqual({
+      type: 'clear-annotation',
+      name: 'pvc',
+      key: BACKUP_NOW,
+    });
   });
 
   test('keeps backup-now pending and does not advance lastAttemptTime when workload-volume state read fails', () => {
@@ -580,23 +548,75 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
       tick3.some((action) => action.type === 'backup-status' && action.name === volumeBackupName),
     ).toBe(true);
 
-    // Also verifies held non-ISO backup-now value (e.g. "true") does not re-dump on subsequent held ticks.
-    const heldTokenDest = {
-      ...afterDumpDest,
+    // Non-ISO backup-now value (e.g. "true") on a destination that already has a prior lastAttemptTime
+    // while volume state is unreadable: Tick 1 dumps the service and normalizes backup-now to NOW so
+    // neither subsequent held ticks nor the volume recovery tick re-dump the service.
+    const priorCronDest = {
+      ...dest,
+      status: {
+        lastAttemptTime: '2026-10-13T01:00:00.000Z',
+        services: [
+          {
+            name: 'orders',
+            type: 'postgres',
+            lastAttemptTime: '2026-10-13T01:00:00.000Z',
+            lastReason: 'Completed',
+            lastSuccessTime: '2026-10-13T01:00:00.000Z',
+          },
+        ],
+      },
       annotations: { [BACKUP_NOW]: 'true' },
     };
-    const heldTokenTick = reconcile({
+    const tokenHeldTick1 = reconcile({
       ...volumeWorld({
-        now: tick2Now,
-        destination: heldTokenDest,
-        destinations: [heldTokenDest],
+        destination: priorCronDest,
+        destinations: [priorCronDest],
         services: [orders],
         workloads: undefined,
         ledger: undefined,
       }),
       volumes: undefined,
     } as World);
-    expect(createdBackups(heldTokenTick)).toEqual([]);
-    expect(heldTokenTick.some((action) => action.type === 'clear-annotation')).toBe(false);
+    expect(createdBackups(tokenHeldTick1)).toEqual([`di-backup-orders-${Date.parse(NOW) / 1000}`]);
+    expect(tokenHeldTick1).toContainEqual({
+      type: 'annotate',
+      name: 'pvc',
+      key: BACKUP_NOW,
+      value: NOW,
+    });
+    expect(tokenHeldTick1.some((action) => action.type === 'clear-annotation')).toBe(false);
+
+    const normalizedHeldDest = {
+      ...afterDumpDest,
+      annotations: { [BACKUP_NOW]: NOW },
+    };
+    const tokenHeldTick1b = reconcile({
+      ...volumeWorld({
+        now: tick2Now,
+        destination: normalizedHeldDest,
+        destinations: [normalizedHeldDest],
+        services: [orders],
+        workloads: undefined,
+        ledger: undefined,
+      }),
+      volumes: undefined,
+    } as World);
+    expect(createdBackups(tokenHeldTick1b)).toEqual([]);
+    expect(tokenHeldTick1b.some((action) => action.type === 'clear-annotation')).toBe(false);
+
+    const tokenRecoveredTick2 = reconcile(
+      volumeWorld({
+        now: tick2Now,
+        destination: normalizedHeldDest,
+        destinations: [normalizedHeldDest],
+        services: [orders],
+      }),
+    );
+    expect(createdBackups(tokenRecoveredTick2)).toEqual([volumeBackupName]);
+    expect(tokenRecoveredTick2).toContainEqual({
+      type: 'clear-annotation',
+      name: 'pvc',
+      key: BACKUP_NOW,
+    });
   });
 });
