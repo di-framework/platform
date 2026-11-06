@@ -93,6 +93,11 @@
               matchLabels:
                 platform.di-framework.dev/component: tenant-auth
                 vcluster.loft.sh/managed-by: vcluster
+          - podSelector:
+              matchLabels:
+                app: di-platform-controller
+                vcluster.loft.sh/managed-by: vcluster
+                vcluster.loft.sh/namespace: wasmcloud
         ports:
           - port: 80
             protocol: TCP

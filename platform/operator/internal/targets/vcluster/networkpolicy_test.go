@@ -136,6 +136,11 @@ var (
 	issuerPod       = synced("pg-stub-oidc", map[string]string{"app": "stub-oidc"})
 	// forgedAuthPod sets the tenant-auth component label on itself, which the syncer copies.
 	forgedAuthPod = synced("l4-probe", map[string]string{labelComponent: "tenant-auth"})
+	// forgedControllerPod sets the platform controller's app label on itself, outside the
+	// platform namespace (#658).
+	forgedControllerPod = synced("l4-probe", map[string]string{labelApp: platformControllerApp})
+	// tenantControllerPod is a tenant's controller: app=tenant-controller, so not the platform's.
+	tenantControllerPod = synced("di-runtime-a", map[string]string{labelApp: "tenant-controller"})
 )
 
 func matches(t *testing.T, s *metav1.LabelSelector, pod map[string]string) bool {
@@ -176,7 +181,8 @@ func admitted(t *testing.T, policies []*networkingv1.NetworkPolicy, src, dst map
 
 // #535: between the instance's own pods the operator admits only the vCluster flows and the
 // issuer, so the platform's synced policies decide the rest (Layer 4 gate 3.2's in-instance row:
-// a probe in a non-platform, non-tenant namespace).
+// a probe in a non-platform, non-tenant namespace). The issuer is reached by the tenant-auth pods
+// and by the platform controller, which registers the tenants' OAuth clients (#59, #658).
 func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 	policies := NetworkPolicies("pi-x", operatorNS, stubIssuer)
 	for _, tc := range []struct {
@@ -197,6 +203,13 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 		{"forged tenant-auth to issuer", forgedAuthPod, issuerPod, []string{"TCP/80", "TCP/8080"}},
 		{"forged tenant-auth to gateway", forgedAuthPod, gatewayPod, nil},
 		{"forged tenant-auth to NATS", forgedAuthPod, natsPod, nil},
+		{"platform controller to issuer", controllerPod, issuerPod, []string{"TCP/80", "TCP/8080"}},
+		{"platform controller to gateway", controllerPod, gatewayPod, nil},
+		{"platform controller to tenant host", controllerPod, tenantHostPod, nil},
+		{"gateway to issuer", gatewayPod, issuerPod, nil},
+		{"tenant controller to issuer", tenantControllerPod, issuerPod, nil},
+		{"forged controller label in l4-probe to issuer", forgedControllerPod, issuerPod, nil},
+		{"forged controller label in l4-probe to NATS", forgedControllerPod, natsPod, nil},
 		{"control plane to NATS", controlPlanePod, natsPod, []string{"*"}},
 		{"control plane to tenant host", controlPlanePod, tenantHostPod, []string{"*"}},
 		{"control plane to itself", controlPlanePod, controlPlanePod, []string{"*"}},
@@ -220,12 +233,15 @@ func TestNetworkPoliciesInsideTheInstance(t *testing.T) {
 }
 
 // #535 W1: with the issuer named in the platform namespace, a forged tenant-auth label opens
-// nothing there, the gateway included.
+// nothing there, the gateway included; nor does the platform controller get more than the
+// platform's own policies give it (#658).
 func TestNetworkPoliciesIssuerInThePlatformNamespace(t *testing.T) {
 	policies := NetworkPolicies("pi-x", operatorNS, &v1alpha1.TenantAuth{IssuerUpstream: "di-platform-gateway.wasmcloud:8080"})
-	for _, dst := range []map[string]string{gatewayPod, natsPod, tenantHostPod} {
-		if got := admitted(t, policies, forgedAuthPod, dst); got != nil {
-			t.Fatalf("forged tenant-auth admitted %v to %v", got, dst)
+	for _, src := range []map[string]string{forgedAuthPod, controllerPod} {
+		for _, dst := range []map[string]string{gatewayPod, natsPod, tenantHostPod} {
+			if got := admitted(t, policies, src, dst); got != nil {
+				t.Fatalf("%v admitted %v to %v", src, got, dst)
+			}
 		}
 	}
 }
