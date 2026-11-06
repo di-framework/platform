@@ -134,9 +134,9 @@ function serviceReadyForBackup(service: ServiceView): boolean {
 
 /** Whether workload-volume state failed to load this tick (#657). */
 function volumeReadFailed(world: World, hasVolumeSources: boolean): boolean {
+  if (!hasVolumeSources) return false;
   if ('volumes' in world && (world as { volumes?: unknown }).volumes === undefined) return true;
-  if ('workloads' in world && world.workloads === undefined) return true;
-  return hasVolumeSources && !volumeStateKnown(world);
+  return !volumeStateKnown(world);
 }
 
 /**
@@ -178,11 +178,13 @@ function serviceForcedAlreadyAttempted(
   world: World,
   dest: DestinationView,
   forced: string,
+  holdForced: boolean,
 ): boolean {
   const last = dest.status.lastAttemptTime;
   if (!last) return false;
-  if (/^\d{4}-\d{2}-\d{2}T/.test(forced) && last > forced) return true;
-  const matched = last === forced || last === world.now;
+  const iso = /^\d{4}-\d{2}-\d{2}T/.test(forced);
+  if (iso && last > forced) return true;
+  const matched = (!iso && holdForced) || last === forced || last === world.now;
   return matched && (dest.status.services ?? []).some((row) => row.lastAttemptTime === last);
 }
 
@@ -648,7 +650,7 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
   const hasReadyServices = services.some(serviceReadyForBackup);
   const holdForced = !!forced && volumeReadFailed(world, volumeSources.length > 0);
   const serviceForcedDue =
-    !!forced && hasReadyServices && !serviceForcedAlreadyAttempted(world, dest, forced);
+    !!forced && hasReadyServices && !serviceForcedAlreadyAttempted(world, dest, forced, holdForced);
   const cronDue = !!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now));
   const serviceDue = cronDue || serviceForcedDue;
   let volumeForcedRequested = false;
@@ -661,10 +663,11 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
     }
     actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
   }
-  const run = serviceDue ? world.now : status.lastAttemptTime;
-  if (serviceDue || volumeForcedRequested) {
+  const runDue = serviceDue || (volumeForcedRequested && !hasReadyServices);
+  if (runDue) {
     status = { ...status, lastAttemptTime: world.now, ...(serviceDue ? { skipped: 0 } : {}) };
   }
+  const run = status.lastAttemptTime;
   let skipped = status.skipped ?? 0;
   const pending: ServiceView[] = [];
   for (const service of services) {

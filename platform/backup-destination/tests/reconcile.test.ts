@@ -527,7 +527,7 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
     expect(cronWhileHeld.some((action) => action.type === 'clear-annotation')).toBe(false);
 
     // Tick 2: when volume state becomes readable, the held backup-now creates the workload-volume Backup
-    // without re-dumping the BackingService, and clears backup-now.
+    // without re-dumping the BackingService or advancing the service watermark, and clears backup-now.
     const tick2Now = '2026-10-13T03:30:10.000Z';
     const tick2 = reconcile(
       volumeWorld({
@@ -537,12 +537,66 @@ describe('#657: backup-now annotation across workload-volume and BackingService 
         services: [orders],
       }),
     );
-    expect(createdBackups(tick2)).toEqual([`di-volume-identity-${Date.parse(tick2Now) / 1000}`]);
+    const volumeBackupName = `di-volume-identity-${Date.parse(tick2Now) / 1000}`;
+    expect(createdBackups(tick2)).toEqual([volumeBackupName]);
     expect(tick2).toContainEqual({
       type: 'clear-annotation',
       name: 'pvc',
       key: BACKUP_NOW,
     });
-    expect(statusFrom(tick2)?.lastAttemptTime).toBe(tick2Now);
+    const status2 = statusFrom(tick2);
+    expect(status2?.lastAttemptTime).toBe(NOW);
+
+    // Tick 3: on the next tick after backup-now is cleared and status2 is persisted, the BackingService
+    // is not re-dumped and the Pending workload-volume Backup proceeds.
+    const afterVolumeRequestDest = {
+      ...afterDumpDest,
+      annotations: {},
+      status: status2 ?? afterDumpDest.status,
+    };
+    const tick3 = reconcile(
+      volumeWorld({
+        now: '2026-10-13T03:30:20.000Z',
+        destination: afterVolumeRequestDest,
+        destinations: [afterVolumeRequestDest],
+        services: [orders],
+        backups: [
+          {
+            name: volumeBackupName,
+            serviceName: 'identity',
+            destinationName: 'pvc',
+            uid: 'uid-identity',
+            type: 'workload-volume',
+            className: '',
+            storage: '1Gi',
+            createdAt: tick2Now,
+            source: { kind: 'workload-volume', workloadName: 'identity' },
+          },
+        ],
+      }),
+    );
+    expect(createdBackups(tick3)).toEqual([]);
+    expect(
+      tick3.some((action) => action.type === 'backup-status' && action.name === volumeBackupName),
+    ).toBe(true);
+
+    // Also verifies held non-ISO backup-now value (e.g. "true") does not re-dump on subsequent held ticks.
+    const heldTokenDest = {
+      ...afterDumpDest,
+      annotations: { [BACKUP_NOW]: 'true' },
+    };
+    const heldTokenTick = reconcile({
+      ...volumeWorld({
+        now: tick2Now,
+        destination: heldTokenDest,
+        destinations: [heldTokenDest],
+        services: [orders],
+        workloads: undefined,
+        ledger: undefined,
+      }),
+      volumes: undefined,
+    } as World);
+    expect(createdBackups(heldTokenTick)).toEqual([]);
+    expect(heldTokenTick.some((action) => action.type === 'clear-annotation')).toBe(false);
   });
 });
