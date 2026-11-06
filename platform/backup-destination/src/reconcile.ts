@@ -24,18 +24,22 @@ import {
   type ServiceView,
   servicePort,
   VERSION,
+  type WorkloadVolumeSource,
   type World,
 } from './model.ts';
 import { isDue, validCron } from './schedule.ts';
 import {
   activeVolumeOps,
   advanceVolumes,
+  backupInFlight,
   backupKeys,
   expiredSources,
   releaseOrphans,
+  requestBackup,
   scheduleSources,
   sourceRows,
   startNext,
+  volumeStateKnown,
 } from './workload.ts';
 
 interface Result {
@@ -121,6 +125,75 @@ function enrolled(world: World): ServiceView[] {
   return [...world.services].sort(
     (a, b) => order(a.type) - order(b.type) || a.name.localeCompare(b.name),
   );
+}
+
+function serviceReadyForBackup(service: ServiceView): boolean {
+  if (service.deleting || !service.ready || service.suspended) return false;
+  const size = parseBytes(service.storage);
+  return size === undefined || size <= DUMP_CAP_BYTES;
+}
+
+/** Whether workload-volume state failed to load this tick (#657). */
+function volumeReadFailed(world: World, hasVolumeSources: boolean): boolean {
+  if ('volumes' in world && (world as { volumes?: unknown }).volumes === undefined) return true;
+  if ('workloads' in world && world.workloads === undefined) return true;
+  return hasVolumeSources && !volumeStateKnown(world);
+}
+
+/**
+ * Whether an on-demand workload-volume backup is already in flight or was already created for
+ * this `backup-now` request (#657).
+ */
+function backupAlreadyCreated(
+  world: World,
+  actions: Action[],
+  workloadName: string,
+  forced: string,
+): boolean {
+  if (backupInFlight(world, workloadName)) return true;
+  const unix = Math.floor(new Date(world.now).getTime() / 1000);
+  const forcedUnix = Math.floor(new Date(forced).getTime() / 1000);
+  const names = new Set([
+    jobName('di-volume', workloadName, unix),
+    ...(Number.isNaN(forcedUnix) ? [] : [jobName('di-volume', workloadName, forcedUnix)]),
+  ]);
+  if (
+    world.backups.some(
+      (item) =>
+        item.source?.workloadName === workloadName &&
+        !item.deleting &&
+        (names.has(item.name) || (!Number.isNaN(forcedUnix) && item.createdAt > forced)),
+    )
+  ) {
+    return true;
+  }
+  return actions.some(
+    (action) =>
+      action.type === 'create-backup' &&
+      (action.body.spec as { source?: { workloadName?: string } } | undefined)?.source
+        ?.workloadName === workloadName,
+  );
+}
+
+function forcedAlreadyAttempted(
+  world: World,
+  dest: DestinationView,
+  volumeSources: WorkloadVolumeSource[],
+  forced: string,
+): boolean {
+  const last = dest.status.lastAttemptTime;
+  if (!last) return false;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(forced)) {
+    if (last > forced) return true;
+    if (last < forced) return false;
+  } else if (last !== world.now) {
+    return false;
+  }
+  const serviceAttempted = (dest.status.services ?? []).some((row) => row.lastAttemptTime === last);
+  const volumesAttempted =
+    volumeSources.length > 0 &&
+    volumeSources.every((source) => backupAlreadyCreated(world, [], source.workloadName, forced));
+  return serviceAttempted || volumesAttempted;
 }
 
 function twoCopy(kind: string): boolean {
@@ -580,13 +653,27 @@ function reconcileDestination(world: World, dest: DestinationView): Action[] {
   // No default schedule (#250): without one, only on-demand backups run.
   const schedule = scheduleOf(dest);
   const forced = dest.annotations[BACKUP_NOW];
-  const due =
-    (!!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now))) ||
-    (!!forced && (!status.lastAttemptTime || forced > status.lastAttemptTime));
+  const volumeSources = (dest.spec.sources ?? []).filter((source) => !source.suspend);
   const services = enrolled(world);
+  const hasTargets = services.some(serviceReadyForBackup) || volumeSources.length > 0;
+  const holdForced = !!forced && volumeReadFailed(world, volumeSources.length > 0);
+  const forcedDue =
+    !!forced && !holdForced && !forcedAlreadyAttempted(world, dest, volumeSources, forced);
+  const cronDue =
+    !holdForced && !!schedule && isDue(schedule, status.lastAttemptTime, new Date(world.now));
+  const due = cronDue || (forcedDue && hasTargets);
   if (due) status = { ...status, lastAttemptTime: world.now, skipped: 0 };
   const run = status.lastAttemptTime;
-  if (forced && due) actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
+  if (forcedDue) {
+    for (const source of volumeSources) {
+      if (!backupAlreadyCreated(world, actions, source.workloadName, forced)) {
+        actions.push(requestBackup(world, dest, source.workloadName));
+      }
+    }
+  }
+  if (forced && !holdForced) {
+    actions.push({ type: 'clear-annotation', name: dest.name, key: BACKUP_NOW });
+  }
   let skipped = status.skipped ?? 0;
   const pending: ServiceView[] = [];
   for (const service of services) {
