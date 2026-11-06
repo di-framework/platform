@@ -39,8 +39,10 @@ const (
 	// of what the platform's di-platform-nats admits (platform-ingress.ts), so it adds no NATS
 	// client once that policy exists.
 	PolicyPlatformNATS = "platform-operator-allow-platform-nats"
-	// PolicyIssuer admits the instance's tenant-auth pods to the pods of the namespace
-	// spec.tenantAuth.issuerUpstream names, on its ports. Only with an issuerUpstream.
+	// PolicyIssuer admits the instance's tenant-auth pods and its platform controller to the pods
+	// of the namespace spec.tenantAuth.issuerUpstream names, on its ports: the controller registers
+	// each tenant's OAuth clients with the issuer's admin API (#59, #658). Only with an
+	// issuerUpstream.
 	PolicyIssuer = "platform-operator-allow-issuer"
 	// PolicySameNamespace admits the vCluster control plane to every pod of the host namespace:
 	// its synced pods (admission webhooks and the API server's other calls into them) and its
@@ -69,8 +71,13 @@ const (
 	labelManagedBy        = "vcluster.loft.sh/managed-by"
 	labelVirtualNamespace = "vcluster.loft.sh/namespace"
 	// labelComponent is the platform's component label; its tenant-auth pods carry
-	// component=tenant-auth and are the ones whose egress reaches the issuerUpstream.
+	// component=tenant-auth and their egress reaches the issuerUpstream.
 	labelComponent = "platform.di-framework.dev/component"
+	// labelApp is the platform's app label on its platform-namespace Deployments (tenancy.ts):
+	// app=di-platform-controller on the platform controller, whose egress also reaches the
+	// issuerUpstream (#658).
+	labelApp              = "app"
+	platformControllerApp = "di-platform-controller"
 	// labelWasmcloudName is the runtime-operator chart's (2.8.0) pod label: wasmcloud.com/name=nats
 	// on its NATS pods (templates/nats/deployment.yaml), =hostgroup on its host group pods
 	// (templates/runtime/deployment.yaml) and =runtime-operator on the operator's
@@ -115,6 +122,13 @@ func natsClientPods() *metav1.LabelSelector {
 	return pods
 }
 
+// platformControllerPods selects the platform controller's synced pods. Only a pod of the
+// platform namespace carries vcluster.loft.sh/namespace=wasmcloud, so an app label forged
+// elsewhere matches nothing.
+func platformControllerPods() *metav1.LabelSelector {
+	return syncedPods(map[string]string{labelVirtualNamespace: targets.PlatformNamespace, labelApp: platformControllerApp})
+}
+
 // ports lists the ports of one protocol.
 func ports(protocol corev1.Protocol, numbers ...int32) []networkingv1.NetworkPolicyPort {
 	out := make([]networkingv1.NetworkPolicyPort, 0, len(numbers))
@@ -151,11 +165,11 @@ func issuerUpstream(auth *v1alpha1.TenantAuth) (namespace string, issuerPorts []
 	return namespace, issuerPorts, len(issuerPorts) > 0
 }
 
-// issuerNamespaceOpenable reports whether PolicyIssuer may open a namespace. Its source label
-// (component=tenant-auth) is copied unchanged by the syncer, so any pod of the instance can forge
-// it: the rule may only open a namespace the platform doesn't use. Not the platform namespace,
-// not kube-system (the instance's CoreDNS), not a di-* namespace the platform creates, and not
-// an empty one.
+// issuerNamespaceOpenable reports whether PolicyIssuer may open a namespace. Its tenant-auth
+// source label (component=tenant-auth) is copied unchanged by the syncer, so any pod of the
+// instance can forge it: the rule may only open a namespace the platform doesn't use. Not the
+// platform namespace, not kube-system (the instance's CoreDNS), not a di-* namespace the
+// platform creates, and not an empty one.
 func issuerNamespaceOpenable(namespace string) bool {
 	return namespace != "" && namespace != targets.PlatformNamespace && namespace != "kube-system" && !strings.HasPrefix(namespace, platformNamespacePrefix)
 }
@@ -179,8 +193,12 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 			},
 		}
 	}
-	from := func(pods *metav1.LabelSelector) []networkingv1.NetworkPolicyPeer {
-		return []networkingv1.NetworkPolicyPeer{{PodSelector: pods}}
+	from := func(pods ...*metav1.LabelSelector) []networkingv1.NetworkPolicyPeer {
+		peers := make([]networkingv1.NetworkPolicyPeer, 0, len(pods))
+		for _, p := range pods {
+			peers = append(peers, networkingv1.NetworkPolicyPeer{PodSelector: p})
+		}
+		return peers
 	}
 	policies := []*networkingv1.NetworkPolicy{
 		allow(PolicyDenyIngress, &metav1.LabelSelector{}),
@@ -196,7 +214,8 @@ func NetworkPolicies(hostNamespace, operatorNamespace string, auth *v1alpha1.Ten
 	}
 	if ns, issuerPorts, ok := issuerUpstream(auth); ok && issuerNamespaceOpenable(ns) {
 		policies = append(policies, allow(PolicyIssuer, syncedPods(map[string]string{labelVirtualNamespace: ns}), networkingv1.NetworkPolicyIngressRule{
-			From: from(syncedPods(map[string]string{labelComponent: "tenant-auth"})), Ports: ports(corev1.ProtocolTCP, issuerPorts...),
+			From:  from(syncedPods(map[string]string{labelComponent: "tenant-auth"}), platformControllerPods()),
+			Ports: ports(corev1.ProtocolTCP, issuerPorts...),
 		}))
 	}
 	return append(policies,

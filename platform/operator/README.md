@@ -303,10 +303,12 @@ these NetworkPolicies in every instance host namespace (`pi-<namespace>-<name>-<
   `vcluster.loft.sh/namespace=wasmcloud`, which the syncer sets from the pod's real namespace, so a pod elsewhere
   that sets `wasmcloud.com/name` on itself gets nothing;
 - `platform-operator-allow-issuer`, only while `tenantAuth.issuerUpstream` is set: the platform's tenant-auth
-  pods (`platform.di-framework.dev/component=tenant-auth`) get in to the pods of the namespace `issuerUpstream`
-  names, on its port and on `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer
-  copies that label unchanged, so any pod of the instance can forge it: the rule only ever opens a namespace
-  the platform doesn't use. It is not rendered when `issuerUpstream` names the platform namespace
+  pods (`platform.di-framework.dev/component=tenant-auth`) and its platform controller
+  (`app=di-platform-controller` in `vcluster.loft.sh/namespace=wasmcloud`, which registers each tenant's OAuth
+  clients with the issuer, #59) get in to the pods of the namespace `issuerUpstream` names, on its port and on
+  `issuerUpstreamPodPort`, which the platform opens on the egress side. The syncer copies the tenant-auth label
+  unchanged, so any pod of the instance can forge it: the rule only ever opens a namespace the platform doesn't
+  use. It is not rendered when `issuerUpstream` names the platform namespace
   (`wasmcloud`, also the default with no namespace), `kube-system`, a `di-*` namespace the platform creates
   (`di-tenant-*`, `di-runtime-*`, `di-apikeys-*`, ...), or an empty one;
 - `platform-operator-allow-same-namespace`: the vCluster control plane gets in to every pod of the namespace,
