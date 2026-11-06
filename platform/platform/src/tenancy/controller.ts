@@ -1763,6 +1763,8 @@ export class Controller {
       this.tenantAuthClean = false;
       await this.removeTenantAuth(tenant);
       await this.removeTenant(tenant);
+      this.tenantErrors.delete(`Tenant/${tenant.metadata.name}`);
+      this.tenantAuthErrors.delete(tenant.metadata.name);
       return;
     }
     for (const name of [n.namespace, n.runtimeNamespace, n.apiKeysNamespace]) {
@@ -1971,10 +1973,11 @@ export class Controller {
     };
     if (failure) {
       const message = failure instanceof Error ? failure.message : 'Reconciliation failed';
-      console.error(`Tenant/${tenant.metadata.name}: ${message}`);
+      this.logTenantError(`Tenant/${tenant.metadata.name}`, 'ReconcileError', message);
       await this.status(tenant, false, 'ReconcileError', message, records, others);
       return;
     }
+    this.tenantErrors.delete(`Tenant/${tenant.metadata.name}`);
     await this.status(
       tenant,
       ready,
@@ -2124,17 +2127,21 @@ export class Controller {
     /** Objects the tenant step read this pass, reused by the inputs and the adoption check. */
     fetched: Map<string, Resource | undefined>,
   ): Promise<Condition | undefined> {
-    const condition = (ok: boolean, reason: string, message: string): Condition => ({
-      type: 'TenantAuthReady',
-      status: ok ? 'True' : 'False',
-      reason,
-      message,
-      observedGeneration: tenant.metadata.generation ?? 1,
-      lastTransitionTime: new Date().toISOString(),
-    });
+    const condition = (ok: boolean, reason: string, message: string, logged = false): Condition => {
+      if (!logged) this.tenantAuthErrors.delete(tenant.metadata.name);
+      return {
+        type: 'TenantAuthReady',
+        status: ok ? 'True' : 'False',
+        reason,
+        message,
+        observedGeneration: tenant.metadata.generation ?? 1,
+        lastTransitionTime: new Date().toISOString(),
+      };
+    };
     try {
       if (!this.cfg.tenantAuth) {
         await this.pruneTenantAuth();
+        this.tenantAuthErrors.delete(tenant.metadata.name);
         return undefined;
       }
       this.tenantAuthClean = false;
@@ -2162,8 +2169,6 @@ export class Controller {
         registryNats: Controller.registryNatsMode(registryNats),
         legacyApiKeys,
       });
-      // The CA Secret was accepted this pass: a later refusal is logged again.
-      this.caRefusals.delete(tenant.metadata.name);
       // Gateway policies for hosts that are no longer routed, pruned before anything is applied
       // so de-routing holds even when a later apply fails.
       const namespace = names(tenant.metadata.name).runtimeNamespace;
@@ -2265,8 +2270,8 @@ export class Controller {
       const keyNamespace = names(tenant.metadata.name).apiKeysNamespace;
       if (apiKeys.failures.length) {
         const message = `API keys not moved to ${keyNamespace}: ${apiKeys.failures.join('; ')}`;
-        console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
-        return condition(false, 'ApiKeyMigrationFailed', message);
+        this.logTenantAuthError(tenant.metadata.name, 'ApiKeyMigrationFailed', message);
+        return condition(false, 'ApiKeyMigrationFailed', message, true);
       }
       const what = this.cfg.tenantAuth.registry
         ? 'tenant controller, console and registry'
@@ -2283,12 +2288,10 @@ export class Controller {
       return condition(true, 'Reconciled', `T${what.slice(1)} are ready`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Tenant-auth reconcile failed';
-      const refused = error instanceof ControllerCaRefused;
-      // A refused CA Secret stays refused until someone acts: logged once, reported every pass.
-      if (!refused || this.caRefusals.get(tenant.metadata.name) !== message)
-        console.error(`Tenant/${tenant.metadata.name} tenant-auth: ${message}`);
-      if (refused) this.caRefusals.set(tenant.metadata.name, message);
-      else this.caRefusals.delete(tenant.metadata.name);
+      let reason = 'ReconcileError';
+      if (error instanceof ControllerCaRefused) reason = 'ControllerCaNotOwned';
+      else if (error instanceof OAuthAdminError) reason = 'OAuthClientError';
+      this.logTenantAuthError(tenant.metadata.name, reason, message);
       if (!this.cfg.tenantAuth) return undefined;
       try {
         // Never leave the quota raised for a pair that was not applied (#121).
@@ -2299,10 +2302,7 @@ export class Controller {
       } catch {
         /* The tenant step lowers it on the next poll. */
       }
-      let reason = 'ReconcileError';
-      if (refused) reason = 'ControllerCaNotOwned';
-      else if (error instanceof OAuthAdminError) reason = 'OAuthClientError';
-      return condition(false, reason, message);
+      return condition(false, reason, message, true);
     }
   }
   /**
@@ -2475,8 +2475,22 @@ export class Controller {
       for (const value of await this.list<Resource>(apiVersion, kind, labels))
         await this.remove(value);
   }
-  /** The last CA Secret refusal logged per tenant (#170), so it is logged once. */
-  private readonly caRefusals = new Map<string, string>();
+  /** The last reconcile error `(reason, message)` logged per `Kind/name` (#663), so it is logged on change. */
+  private readonly tenantErrors = new Map<string, string>();
+  /** The last tenant-auth error `(reason, message)` logged per tenant (#170, #663), so it is logged on change. */
+  private readonly tenantAuthErrors = new Map<string, string>();
+  private logTenantError(target: string, reason: string, message: string): void {
+    const signature = `${reason}: ${message}`;
+    if (this.tenantErrors.get(target) === signature) return;
+    this.tenantErrors.set(target, signature);
+    console.error(`${target}: ${message}`);
+  }
+  private logTenantAuthError(name: string, reason: string, message: string): void {
+    const signature = `${reason}: ${message}`;
+    if (this.tenantAuthErrors.get(name) === signature) return;
+    this.tenantAuthErrors.set(name, signature);
+    console.error(`Tenant/${name} tenant-auth: ${message}`);
+  }
   /** True once a sweep found no tenant-auth objects; reset when a Tenant is deleted. */
   private tenantAuthClean = false;
   /**
@@ -2562,12 +2576,14 @@ export class Controller {
     }
     if (user.metadata.deletionTimestamp) {
       await this.finalizer(user, false);
+      this.tenantErrors.delete(`User/${user.metadata.name}`);
       return;
     }
     const complete =
       user.spec.suspended ||
       desired.filter((r) => r.kind === 'RoleBinding').length === user.spec.memberships.length * 2;
     const ready = complete && tokens;
+    this.tenantErrors.delete(`User/${user.metadata.name}`);
     await this.status(
       user,
       !!ready,
@@ -3538,7 +3554,7 @@ export class Controller {
    * (removed, suspended or being deleted; their host pods are stopped). A tenant that comes back
    * starts as after a controller restart.
    */
-  private forgetTenants(tenants: readonly Tenant[]): void {
+  private forgetTenants(tenants: readonly Tenant[], users: readonly User[] = []): void {
     const listed = new Set(tenants.map((tenant) => tenant.metadata.name));
     const projected = new Set(
       tenants
@@ -3549,7 +3565,14 @@ export class Controller {
     const uids = new Set(tenants.map((tenant) => tenant.metadata.uid ?? ''));
     for (const uid of this.storageListings.keys())
       if (!uids.has(uid)) this.storageListings.delete(uid);
-    for (const name of this.caRefusals.keys()) if (!listed.has(name)) this.caRefusals.delete(name);
+    const targets = new Set([
+      ...tenants.map((tenant) => `Tenant/${tenant.metadata.name}`),
+      ...users.map((user) => `User/${user.metadata.name}`),
+    ]);
+    for (const target of this.tenantErrors.keys())
+      if (!targets.has(target)) this.tenantErrors.delete(target);
+    for (const name of this.tenantAuthErrors.keys())
+      if (!listed.has(name)) this.tenantAuthErrors.delete(name);
     this.identities.forget(listed);
     for (const name of this.logCursors.keys())
       if (!projected.has(name)) this.logCursors.delete(name);
@@ -3672,7 +3695,7 @@ export class Controller {
     const bindings = await this.list<ServiceBinding>(VERSION, 'ServiceBinding', {});
     await this.recoverUnlistedTenants(tenants, users, services, bindings);
     const tenantByName = new Map(tenants.map((t) => [t.metadata.name, t]));
-    this.forgetTenants(tenants);
+    this.forgetTenants(tenants, users);
     this.refreshApplyCache(tenants);
     for (const value of [...tenants, ...users]) {
       try {
@@ -3680,7 +3703,7 @@ export class Controller {
         else await this.reconcileUser(value as User, tenants);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Reconciliation failed';
-        console.error(`${value.kind}/${value.metadata.name}: ${message}`);
+        this.logTenantError(`${value.kind}/${value.metadata.name}`, 'ReconcileError', message);
         try {
           await this.status(value, false, 'ReconcileError', message);
         } catch {
