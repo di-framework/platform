@@ -146,7 +146,7 @@ function tlsFixture(dnsName = 'tenant-controller', days = 30): TenantAuthInputs[
   return { ...leaf, caCert: ca.cert, caKey: ca.key };
 }
 const tls = tlsFixture();
-const inputs: TenantAuthInputs = {
+const inputs = {
   members: [
     { name: 'alice', role: 'developer', suspended: false },
     { name: 'bob', role: 'viewer', suspended: false },
@@ -158,7 +158,7 @@ const inputs: TenantAuthInputs = {
     consoleClientSecret: 'c2VjcmV0',
     cliClientId: 'tenant-alpha-alphauid-cli',
   },
-};
+} satisfies TenantAuthInputs;
 type Deployment = Resource & {
   spec: {
     replicas: number;
@@ -4034,6 +4034,102 @@ describe('tenant hosts TLS front (#113:https-hop)', () => {
     await silently(() => new Controller(api, cfg).reconcileTenant(t, []));
     expect(front(host(api))).toBeUndefined();
     expect(digestOf(host(api))).toBeUndefined();
+  });
+
+  it('creates and repairs the CA, leaf TLS Secret and registry pull Secret when OIDC discovery fails (#673)', async () => {
+    const { api, t } = prepare();
+    const withRegistryCfg: ControllerConfig = {
+      ...cfg,
+      routeUrlPattern: 'http://{host}.{tenant}.localhost:28180',
+      tenantAuth: {
+        ...auth,
+        registry: {
+          component: `ghcr.io/di-framework/oci-registry@sha256:${'b'.repeat(64)}`,
+          publicUrl: 'https://registry.{tenant}.localhost:28180',
+        },
+      },
+    };
+    const caKeyPath = path('Secret', 'wasmcloud', 'tenant-controller-ca-alpha');
+    const caMapPath = path('ConfigMap', 'di-runtime-alpha', 'tenant-controller-ca');
+    const pullSecretPath = path('Secret', 'di-runtime-alpha', REGISTRY_PULL_SECRET);
+    const oauthSecretPath = path('Secret', 'di-runtime-alpha', 'tenant-console-oauth');
+    const consolePath = path('Deployment', 'di-runtime-alpha', 'tenant-console');
+    const condition = (type: string) => t.status?.conditions?.find((c) => c.type === type);
+
+    const fake = new FakeIdentityAdmin();
+    const inner = fake.registry();
+    let down = true;
+    const discoveryError = oauthAdminError(
+      0,
+      'OAuth client provisioning for tenant "alpha" failed at discovery "http://stub-oidc/.well-known/openid-configuration": getaddrinfo ENOTFOUND stub-oidc',
+    );
+    const registry: OAuthClientRegistry = {
+      ...inner,
+      get: (id) => {
+        if (down) throw discoveryError;
+        return inner.get(id);
+      },
+    };
+    const controller = new BaseController(api, withRegistryCfg, undefined, undefined, registry);
+
+    // 1. Fresh tenant while OIDC issuer is unreachable: CA, leaf TLS Secret, and registry pull
+    // Secret are still created, and on the next pass the hostgroup wires its TLS front and stays
+    // Ready=True while TenantAuthReady reports OAuthClientError.
+    await silently(async () => {
+      await controller.reconcileTenant(t, []);
+      await controller.reconcileTenant(t, []);
+    });
+    expect(api.objects.get(caKeyPath)).toBeDefined();
+    expect(api.objects.get(caMapPath)).toBeDefined();
+    expect(api.objects.get(leafPath)).toBeDefined();
+    expect(api.objects.get(pullSecretPath)).toBeDefined();
+    expect(api.objects.get(oauthSecretPath)).toBeUndefined();
+    expect(api.objects.get(controllerPath)).toBeUndefined();
+    expect(api.objects.get(consolePath)).toBeUndefined();
+    expect(front(host(api))).toBeDefined();
+    expect(digestOf(host(api))).toBe(tlsCertDigest(leafOf(api)));
+    expect(condition('Ready')).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    expect(condition('TenantAuthReady')).toMatchObject({
+      status: 'False',
+      reason: 'OAuthClientError',
+      message: discoveryError.message,
+    });
+
+    // 2. OIDC recovers: the tenant-auth pair and registry deploy and wire the hostgroup.
+    down = false;
+    await controller.reconcileTenant(t, []);
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(oauthSecretPath)).toBeDefined();
+    expect(api.objects.get(controllerPath)).toBeDefined();
+    expect(api.objects.get(consolePath)).toBeDefined();
+    const preservedCa = (api.objects.get(caMapPath)!.data as Record<string, string>)['ca.crt']!;
+
+    // 3. vCluster owner-Service resync / GC deletes the runtime TLS Secret, CA ConfigMap, and
+    // registry pull Secret while OIDC is unreachable again: reconcileTenantAuth recreates all
+    // three before throwing OAuthAdminError so hostgroup pods never block on missing volumes.
+    down = true;
+    api.objects.delete(leafPath);
+    api.objects.delete(caMapPath);
+    api.objects.delete(pullSecretPath);
+    await silently(async () => {
+      await controller.reconcileTenant(t, []);
+    });
+    expect(api.objects.get(caMapPath)?.data).toEqual({ 'ca.crt': preservedCa });
+    expect(api.objects.get(leafPath)).toBeDefined();
+    expect(
+      issuedBy(
+        preservedCa,
+        leafOf(api),
+        decode((api.objects.get(leafPath)!.data as Record<string, string>)['tls.key']!),
+      ),
+    ).toBe(true);
+    expect(api.objects.get(pullSecretPath)).toBeDefined();
+    expect(condition('Ready')).toMatchObject({ status: 'True', reason: 'Reconciled' });
+    expect(condition('TenantAuthReady')).toMatchObject({
+      status: 'False',
+      reason: 'OAuthClientError',
+      message: discoveryError.message,
+    });
   });
 });
 

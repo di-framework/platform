@@ -320,9 +320,11 @@ export interface TenantAuthInputs {
   };
   /**
    * The tenant's own OAuth clients (#59): the console's confidential client with its secret
-   * (base64, as Secret data) and the CLI's public PKCE client.
+   * (base64, as Secret data) and the CLI's public PKCE client. Absent when OAuth client
+   * provisioning fails (#673), so the CA, leaf TLS Secret and registry pull Secret are still
+   * rendered for the tenant hosts.
    */
-  oauthClients: { consoleClientId: string; consoleClientSecret: string; cliClientId: string };
+  oauthClients?: { consoleClientId: string; consoleClientSecret: string; cliClientId: string };
   /**
    * Whether the registry front may forward to the registry (W4/W6 of the #83 review): true only
    * when the tenant is not suspended and no other workload claims the registry host. Registry
@@ -2064,7 +2066,7 @@ export const CA_BUNDLE_ANNOTATION = `${GROUP}/ca-bundle-sha256`;
 /** The console pod template's digest of its OAuth client id and secret (#59). */
 export const CONSOLE_OAUTH_ANNOTATION = `${GROUP}/console-oauth-sha256`;
 /** {@link CONSOLE_OAUTH_ANNOTATION}'s value for the rendered client. */
-export function consoleOAuthDigest(clients: TenantAuthInputs['oauthClients']): string {
+export function consoleOAuthDigest(clients: NonNullable<TenantAuthInputs['oauthClients']>): string {
   return createHash('sha256')
     .update(`${clients.consoleClientId}\n${clients.consoleClientSecret}`)
     .digest('hex');
@@ -2147,146 +2149,6 @@ function tenantAuthResources(
   const issuerPort = Number(issuer.port || (issuer.protocol === 'https:' ? 443 : 80));
   const issuerIp =
     auth.issuerIp ?? (/^\d+\.\d+\.\d+\.\d+$/.test(issuer.hostname) ? issuer.hostname : undefined);
-  const loopback = loopbackHost(issuer.hostname);
-  const sidecarTarget = auth.issuerUpstream ?? (auth.issuerIp && `${auth.issuerIp}:${issuerPort}`);
-  const securityContext = {
-    allowPrivilegeEscalation: false,
-    readOnlyRootFilesystem: true,
-    capabilities: { drop: ['ALL'] },
-  };
-  const deployment = (
-    app: 'tenant-controller' | 'tenant-console',
-    port: number,
-    env: Record<string, string>,
-    extraEnv: unknown[],
-    volume: Record<string, unknown>,
-    mountPath: string,
-    extraPorts: { containerPort: number; name: string }[] = [],
-  ) =>
-    make('apps/v1', 'Deployment', app, namespace, {
-      spec: {
-        // One replica: the controller keeps proxy sessions in memory. Recreate, because a
-        // surge pod would not fit the runtime quota.
-        replicas: suspended ? 0 : 1,
-        strategy: { type: 'Recreate' },
-        selector: { matchLabels: { app } },
-        template: {
-          metadata: {
-            labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
-            // The image reference rolls the pods; the digest is repeated here for operators. Both
-            // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
-            // Both also read the trust bundle once: the console copies it into the kubeconfigs it
-            // issues and the controller verifies the hosts' TLS front with it (#113), so a bundle
-            // change during a CA rotation (#170) rolls the pair too.
-            annotations: {
-              [`${GROUP}/image-digest`]: auth.image.split('@')[1],
-              [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
-              [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)),
-              // The console reads its client secret once at start too, so a secret issued
-              // again for the same client (#59) rolls it.
-              ...(app === 'tenant-console'
-                ? { [CONSOLE_OAUTH_ANNOTATION]: consoleOAuthDigest(inputs.oauthClients) }
-                : {}),
-            },
-          },
-          spec: {
-            serviceAccountName: app,
-            // Never automounted: the controller's token is projected into its own container
-            // only, so the issuer-proxy sidecar holds no credential.
-            automountServiceAccountToken: false,
-            ...(!loopback && auth.issuerIp
-              ? { hostAliases: [{ ip: auth.issuerIp, hostnames: [issuer.hostname] }] }
-              : {}),
-            securityContext: {
-              runAsNonRoot: true,
-              runAsUser: 1000,
-              runAsGroup: 1000,
-              seccompProfile: { type: 'RuntimeDefault' },
-            },
-            containers: [
-              {
-                name: app,
-                image: auth.image,
-                command: [
-                  'bun',
-                  `/app/${app === 'tenant-controller' ? 'controller' : 'console'}.js`,
-                ],
-                env: [
-                  { name: 'TMPDIR', value: '/tmp' },
-                  ...Object.entries(env).map(([k, v]) => ({ name: k, value: v })),
-                  ...extraEnv,
-                ],
-                ports: [{ containerPort: port, name: 'http' }, ...extraPorts],
-                readinessProbe: {
-                  httpGet:
-                    app === 'tenant-controller'
-                      ? { path: '/-/healthz', port, scheme: 'HTTPS' }
-                      : { path: '/healthz', port, scheme: 'HTTP' },
-                  periodSeconds: 5,
-                },
-                resources: {
-                  requests: { cpu: '50m', memory: '96Mi' },
-                  limits: { cpu: '200m', memory: '192Mi' },
-                },
-                securityContext,
-                volumeMounts: [
-                  { name: 'tmp', mountPath: '/tmp' },
-                  { name: 'mounted', mountPath, readOnly: true },
-                  ...(app === 'tenant-controller'
-                    ? [
-                        {
-                          name: 'service-account',
-                          mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
-                          readOnly: true,
-                        },
-                        // The trust bundle the controller verifies the hosts' TLS front with (#113).
-                        { name: 'ca', mountPath: '/ca', readOnly: true },
-                      ]
-                    : []),
-                ],
-              },
-              ...(loopback && sidecarTarget
-                ? [
-                    {
-                      name: 'issuer-proxy',
-                      image: ISSUER_PROXY_IMAGE,
-                      args: [
-                        `TCP-LISTEN:${issuerPort},fork,reuseaddr,bind=127.0.0.1`,
-                        `TCP:${sidecarTarget}`,
-                      ],
-                      resources: {
-                        requests: { cpu: '10m', memory: '16Mi' },
-                        limits: { cpu: '50m', memory: '32Mi' },
-                      },
-                      securityContext,
-                    },
-                  ]
-                : []),
-            ],
-            volumes: [
-              { name: 'tmp', emptyDir: {} },
-              { name: 'mounted', ...volume },
-              ...(app === 'tenant-controller'
-                ? [
-                    serviceAccountVolume(),
-                    { name: 'ca', configMap: { name: 'tenant-controller-ca' } },
-                  ]
-                : []),
-            ],
-          },
-        },
-      },
-    });
-  const service = (app: string, port: number, extra: { port: number; name: string }[] = []) =>
-    make('v1', 'Service', app, namespace, {
-      spec: {
-        selector: { app },
-        ports: [{ port, targetPort: port, name: 'http' }, ...extra].map((value) => ({
-          ...value,
-          targetPort: value.port,
-        })),
-      },
-    });
   const registry = auth.registry;
   const registryHost = registryHttpHost(auth);
   const hostPods = {
@@ -2577,14 +2439,156 @@ function tenantAuthResources(
         data: registryPullSecretData(name, hostPullToken),
       }),
     );
+  const { oauthClients } = inputs;
+  if (!oauthClients) return result;
+  const loopback = loopbackHost(issuer.hostname);
+  const sidecarTarget = auth.issuerUpstream ?? (auth.issuerIp && `${auth.issuerIp}:${issuerPort}`);
+  const securityContext = {
+    allowPrivilegeEscalation: false,
+    readOnlyRootFilesystem: true,
+    capabilities: { drop: ['ALL'] },
+  };
+  const deployment = (
+    app: 'tenant-controller' | 'tenant-console',
+    port: number,
+    env: Record<string, string>,
+    extraEnv: unknown[],
+    volume: Record<string, unknown>,
+    mountPath: string,
+    extraPorts: { containerPort: number; name: string }[] = [],
+  ) =>
+    make('apps/v1', 'Deployment', app, namespace, {
+      spec: {
+        // One replica: the controller keeps proxy sessions in memory. Recreate, because a
+        // surge pod would not fit the runtime quota.
+        replicas: suspended ? 0 : 1,
+        strategy: { type: 'Recreate' },
+        selector: { matchLabels: { app } },
+        template: {
+          metadata: {
+            labels: { app, [COMPONENT]: 'tenant-auth', [TENANT]: name },
+            // The image reference rolls the pods; the digest is repeated here for operators. Both
+            // binaries read the certificate (or CA) once at start, so its digest rolls the pair.
+            // Both also read the trust bundle once: the console copies it into the kubeconfigs it
+            // issues and the controller verifies the hosts' TLS front with it (#113), so a bundle
+            // change during a CA rotation (#170) rolls the pair too.
+            annotations: {
+              [`${GROUP}/image-digest`]: auth.image.split('@')[1],
+              [`${GROUP}/tls-cert-sha256`]: tlsCertDigest(inputs.tls.cert),
+              [CA_BUNDLE_ANNOTATION]: tlsCertDigest(controllerTrustBundle(inputs.tls)),
+              // The console reads its client secret once at start too, so a secret issued
+              // again for the same client (#59) rolls it.
+              ...(app === 'tenant-console'
+                ? { [CONSOLE_OAUTH_ANNOTATION]: consoleOAuthDigest(oauthClients) }
+                : {}),
+            },
+          },
+          spec: {
+            serviceAccountName: app,
+            // Never automounted: the controller's token is projected into its own container
+            // only, so the issuer-proxy sidecar holds no credential.
+            automountServiceAccountToken: false,
+            ...(!loopback && auth.issuerIp
+              ? { hostAliases: [{ ip: auth.issuerIp, hostnames: [issuer.hostname] }] }
+              : {}),
+            securityContext: {
+              runAsNonRoot: true,
+              runAsUser: 1000,
+              runAsGroup: 1000,
+              seccompProfile: { type: 'RuntimeDefault' },
+            },
+            containers: [
+              {
+                name: app,
+                image: auth.image,
+                command: [
+                  'bun',
+                  `/app/${app === 'tenant-controller' ? 'controller' : 'console'}.js`,
+                ],
+                env: [
+                  { name: 'TMPDIR', value: '/tmp' },
+                  ...Object.entries(env).map(([k, v]) => ({ name: k, value: v })),
+                  ...extraEnv,
+                ],
+                ports: [{ containerPort: port, name: 'http' }, ...extraPorts],
+                readinessProbe: {
+                  httpGet:
+                    app === 'tenant-controller'
+                      ? { path: '/-/healthz', port, scheme: 'HTTPS' }
+                      : { path: '/healthz', port, scheme: 'HTTP' },
+                  periodSeconds: 5,
+                },
+                resources: {
+                  requests: { cpu: '50m', memory: '96Mi' },
+                  limits: { cpu: '200m', memory: '192Mi' },
+                },
+                securityContext,
+                volumeMounts: [
+                  { name: 'tmp', mountPath: '/tmp' },
+                  { name: 'mounted', mountPath, readOnly: true },
+                  ...(app === 'tenant-controller'
+                    ? [
+                        {
+                          name: 'service-account',
+                          mountPath: '/var/run/secrets/kubernetes.io/serviceaccount',
+                          readOnly: true,
+                        },
+                        // The trust bundle the controller verifies the hosts' TLS front with (#113).
+                        { name: 'ca', mountPath: '/ca', readOnly: true },
+                      ]
+                    : []),
+                ],
+              },
+              ...(loopback && sidecarTarget
+                ? [
+                    {
+                      name: 'issuer-proxy',
+                      image: ISSUER_PROXY_IMAGE,
+                      args: [
+                        `TCP-LISTEN:${issuerPort},fork,reuseaddr,bind=127.0.0.1`,
+                        `TCP:${sidecarTarget}`,
+                      ],
+                      resources: {
+                        requests: { cpu: '10m', memory: '16Mi' },
+                        limits: { cpu: '50m', memory: '32Mi' },
+                      },
+                      securityContext,
+                    },
+                  ]
+                : []),
+            ],
+            volumes: [
+              { name: 'tmp', emptyDir: {} },
+              { name: 'mounted', ...volume },
+              ...(app === 'tenant-controller'
+                ? [
+                    serviceAccountVolume(),
+                    { name: 'ca', configMap: { name: 'tenant-controller-ca' } },
+                  ]
+                : []),
+            ],
+          },
+        },
+      },
+    });
+  const service = (app: string, port: number, extra: { port: number; name: string }[] = []) =>
+    make('v1', 'Service', app, namespace, {
+      spec: {
+        selector: { app },
+        ports: [{ port, targetPort: port, name: 'http' }, ...extra].map((value) => ({
+          ...value,
+          targetPort: value.port,
+        })),
+      },
+    });
   // The tenant's own console client (#59); the id is kept with the secret so a reconcile can tell
   // whether the stored secret belongs to the current client.
   result.push(
     make('v1', 'Secret', 'tenant-console-oauth', namespace, {
       type: 'Opaque',
       data: {
-        clientId: base64(inputs.oauthClients.consoleClientId),
-        clientSecret: inputs.oauthClients.consoleClientSecret,
+        clientId: base64(oauthClients.consoleClientId),
+        clientSecret: oauthClients.consoleClientSecret,
       },
     }),
     deployment(
@@ -2599,7 +2603,7 @@ function tenantAuthResources(
         TENANT_CONTROLLER_TLS_CERT: '/tls/tls.crt',
         TENANT_CONTROLLER_TLS_KEY: '/tls/tls.key',
         // The tenant's own public PKCE client, which `/v1/auth/info` names for the CLI (#59).
-        TENANT_CONTROLLER_CLI_CLIENT_ID: inputs.oauthClients.cliClientId,
+        TENANT_CONTROLLER_CLI_CLIENT_ID: oauthClients.cliClientId,
         // The trust bundle for the hosts' TLS front (#113 `:https-hop`): both CAs of a rotation,
         // so a host still serving the previous leaf verifies while the hosts roll.
         TENANT_CONTROLLER_HOST_CA: '/ca/ca.crt',
@@ -2655,7 +2659,7 @@ function tenantAuthResources(
       {
         TENANT_CONSOLE_TENANT: name,
         TENANT_CONSOLE_ISSUER: auth.issuer,
-        TENANT_CONSOLE_CLIENT_ID: inputs.oauthClients.consoleClientId,
+        TENANT_CONSOLE_CLIENT_ID: oauthClients.consoleClientId,
         TENANT_CONSOLE_HOST: '0.0.0.0',
         TENANT_CONSOLE_PORT: '8787',
         TENANT_CONSOLE_PUBLIC_URL: tenantConsolePublicUrl(name, auth),
