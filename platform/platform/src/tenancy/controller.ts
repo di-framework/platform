@@ -664,7 +664,9 @@ export class Controller {
   }
   /**
    * Server-side apply `value` unless a foreign object holds its name. `fetched` holds objects this
-   * pass already read, keyed by path, so the adoption check does not GET them again.
+   * pass already read, keyed by path, so the adoption check does not GET them again. Once ownership
+   * is verified (or the object does not exist yet), `force=true` reclaims any controller-declared
+   * field a foreign manager (`kubectl-label`, `kubectl-edit`) took (#660).
    */
   private async ensure(
     value: Resource,
@@ -714,7 +716,7 @@ export class Controller {
       return existing;
     const applied = await this.api.call<Resource>(
       'PATCH',
-      `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}`,
+      `${location(value)}?fieldManager=${CONTROLLER_FIELD_MANAGER}&force=true`,
       value,
       'application/apply-patch+yaml',
     );

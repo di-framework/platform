@@ -961,6 +961,49 @@ describe('reconcileTenant with tenant-auth', () => {
     expect(t.status?.conditions?.[0]?.status).toBe('True');
   });
 
+  it('reclaims a foreign fieldManager conflict on tenant-auth-egress with force=true and keeps TenantAuthReady True (#660)', async () => {
+    const { api, controller, t } = prepare();
+    await controller.reconcileTenant(t, []);
+    const egressPath = `${collection('networking.k8s.io/v1', 'NetworkPolicy', 'di-runtime-alpha')}/tenant-auth-egress`;
+    const consoleSvcPath = path('Service', 'di-runtime-alpha', 'tenant-console');
+    // Simulate `kubectl label` editing a controller-declared label on tenant-auth-egress and
+    // `tenant-console` Service being deleted in the same window.
+    const egress = must(api, egressPath);
+    api.seed({
+      ...egress,
+      metadata: {
+        ...egress.metadata,
+        resourceVersion: 'edited-by-kubectl-label',
+        labels: { ...egress.metadata.labels, [COMPONENT]: 'drifted' },
+      },
+    });
+    api.objects.delete(consoleSvcPath);
+    const call = api.call.bind(api);
+    api.call = async <T>(
+      method: string,
+      urlPath: string,
+      body?: unknown,
+      contentType?: string,
+    ): Promise<T> => {
+      if (
+        method === 'PATCH' &&
+        contentType === 'application/apply-patch+yaml' &&
+        new URL(urlPath, 'https://kubernetes').searchParams.get('force') !== 'true'
+      ) {
+        throw new ApiError(
+          409,
+          `PATCH ${urlPath} returned 409: kubectl-label: .metadata.labels.platform.di-framework.dev/component`,
+        );
+      }
+      return call<T>(method, urlPath, body);
+    };
+    await controller.reconcileTenant(t, []);
+    expect(api.objects.get(egressPath)?.metadata.labels?.[COMPONENT]).toBe('tenant-auth');
+    expect(api.objects.get(consoleSvcPath)?.kind).toBe('Service');
+    expect(t.status?.conditions?.find((c) => c.type === 'TenantAuthReady')?.status).toBe('True');
+    expect(t.status?.conditions?.find((c) => c.type === 'Ready')?.status).toBe('True');
+  });
+
   it('recomputes the TokenRequest resourceNames when User memberships change', async () => {
     const { api, controller, t } = prepare();
     await controller.reconcileTenant(t, [user('alice', ['alpha']), user('bob', ['alpha'])]);
