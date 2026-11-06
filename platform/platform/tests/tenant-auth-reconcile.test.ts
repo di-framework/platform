@@ -4182,11 +4182,25 @@ describe('controller error log throttling (#663)', () => {
     });
     expect(afterRecovery).toEqual([`Tenant/alpha: ${conflict2}`]);
 
-    // 4. Tenant deletion (deletionTimestamp and forgetTenants on tick) cleans up the throttle state.
-    api.fail = undefined;
+    // 4. Tenant deletion (deletionTimestamp and forgetTenants on tick) throttles errors while
+    // removal is failing, then cleans up the throttle state once removal succeeds.
     t.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    api.seed(t);
+    const crbPath = path('ClusterRoleBinding', undefined, 'di-tenant-controller-alpha');
+    const deleteErr = `DELETE ${crbPath} returned 500: etcd timeout`;
+    api.fail = (method, p) =>
+      method === 'DELETE' && p === crbPath ? new ApiError(500, deleteErr) : undefined;
+    const duringDeletion = await captureErrors(async () => {
+      await controller.tick();
+      await controller.tick();
+    });
+    expect(duringDeletion.filter((line) => line.startsWith('Tenant/alpha:'))).toEqual([
+      `Tenant/alpha: ${deleteErr}`,
+    ]);
+    api.fail = undefined;
     await controller.reconcileTenant(t, []);
     delete t.metadata.deletionTimestamp;
+    api.seed(t);
     // Also cover the outer tick() catch path (e.g. a conflict on Namespace apply) and forgetTenants.
     const nsConflict = `PATCH ${nsPath} returned 409: foreign-manager: .metadata.labels`;
     api.fail = (method, p) =>
@@ -4204,6 +4218,79 @@ describe('controller error log throttling (#663)', () => {
     const afterForget = await captureErrors(() => controller.tick());
     expect(afterForget.filter((line) => line.startsWith('Tenant/alpha:'))).toEqual([
       `Tenant/alpha: ${nsConflict}`,
+    ]);
+  });
+
+  it('throttles User reconcile errors across ticks without colliding with same-named Tenants or being wiped by forgetTenants', async () => {
+    const { api, controller } = prepare();
+    const uSame = user('alpha', ['alpha']);
+    const uOther = user('bob', ['alpha']);
+    api.seed(uSame);
+    api.seed(uOther);
+    const saSamePath = path('ServiceAccount', 'wasmcloud', 'di-user-alpha');
+    const saOtherPath = path('ServiceAccount', 'wasmcloud', 'di-user-bob');
+    const tenantErr = `PATCH ${nsPath} returned 409: foreign-manager: .metadata.labels`;
+    const userSameErr = `PATCH ${saSamePath} returned 409: foreign-manager: .metadata.labels`;
+    const userOtherErr = `PATCH ${saOtherPath} returned 409: foreign-manager: .metadata.labels`;
+    api.fail = (method, p) => {
+      if (method !== 'PATCH') return undefined;
+      if (p.startsWith(nsPath)) return new ApiError(409, tenantErr);
+      if (p.startsWith(saSamePath)) return new ApiError(409, userSameErr);
+      if (p.startsWith(saOtherPath)) return new ApiError(409, userOtherErr);
+      return undefined;
+    };
+
+    // 1. Both Tenant/alpha, User/alpha (same name), and User/bob (not a tenant name) log only once across ticks.
+    const first = await captureErrors(async () => {
+      for (let i = 0; i < 3; i++) await controller.tick();
+    });
+    expect(
+      first.filter((line) => line.startsWith('Tenant/alpha:') || line.startsWith('User/')),
+    ).toEqual([
+      `Tenant/alpha: ${tenantErr}`,
+      `User/alpha: ${userSameErr}`,
+      `User/bob: ${userOtherErr}`,
+    ]);
+
+    // 2. Recovery of User/bob clears its throttle state so a subsequent error logs again.
+    api.fail = (method, p) => {
+      if (method !== 'PATCH') return undefined;
+      if (p.startsWith(nsPath)) return new ApiError(409, tenantErr);
+      if (p.startsWith(saSamePath)) return new ApiError(409, userSameErr);
+      return undefined;
+    };
+    await captureErrors(() => controller.tick());
+    api.fail = (method, p) => {
+      if (method !== 'PATCH') return undefined;
+      if (p.startsWith(nsPath)) return new ApiError(409, tenantErr);
+      if (p.startsWith(saSamePath)) return new ApiError(409, userSameErr);
+      if (p.startsWith(saOtherPath)) return new ApiError(409, userOtherErr);
+      return undefined;
+    };
+    const afterUserRecovery = await captureErrors(async () => {
+      await controller.tick();
+      await controller.tick();
+    });
+    expect(
+      afterUserRecovery.filter(
+        (line) => line.startsWith('Tenant/alpha:') || line.startsWith('User/'),
+      ),
+    ).toEqual([`User/bob: ${userOtherErr}`]);
+
+    // 3. User deletion via deletionTimestamp clears its throttle state once removal succeeds.
+    api.fail = undefined;
+    uSame.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+    await controller.reconcileUser(uSame, []);
+    delete uSame.metadata.deletionTimestamp;
+    api.seed(uSame);
+    api.fail = (method, p) =>
+      method === 'PATCH' && p.startsWith(saSamePath) ? new ApiError(409, userSameErr) : undefined;
+    const afterUserDeletion = await captureErrors(async () => {
+      await controller.tick();
+      await controller.tick();
+    });
+    expect(afterUserDeletion.filter((line) => line.startsWith('User/alpha:'))).toEqual([
+      `User/alpha: ${userSameErr}`,
     ]);
   });
 });
