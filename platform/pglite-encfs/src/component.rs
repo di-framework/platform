@@ -18,8 +18,10 @@
 //! - Codec-4 files keep per-file state ([`FileState`], design note 6.1),
 //!   shared by every descriptor of the inode and keyed by its host identity
 //!   (`metadata-hash`) and file id. It is kept while a descriptor is open or
-//!   the file is dirty, and dropped when encfs unlinks or renames over the
-//!   inode's last name.
+//!   the file is dirty; when the last descriptor of a clean file closes, its
+//!   logical size stays in a bounded cache keyed by host identity (5.3, #654),
+//!   and both are dropped when encfs unlinks or renames over the inode's last
+//!   name.
 
 mod bindings {
     wit_bindgen::generate!({
@@ -72,7 +74,7 @@ use crate::marker::{
 };
 use crate::rotation;
 use crate::slots::{SlotError, SlotFile, SlotKeys};
-use crate::writer::{give_birth, Durable, FailStops, FileState, IntegrityFile};
+use crate::writer::{give_birth, Durable, FailStops, FileState, Files, IntegrityFile};
 
 type R<T> = Result<T, ErrorCode>;
 
@@ -128,9 +130,9 @@ thread_local! {
     static STATE: OnceCell<Rc<State>> = const { OnceCell::new() };
     static LOGGED: RefCell<BTreeSet<&'static str>> = const { RefCell::new(BTreeSet::new()) };
     /// The state of each codec-4 file in use, by the host identity of its
-    /// inode (design note 6.1).
-    static FILES: RefCell<BTreeMap<DirId, Rc<RefCell<FileState>>>> =
-        const { RefCell::new(BTreeMap::new()) };
+    /// inode (design note 6.1), and the bounded size cache for inodes with
+    /// no open descriptor (5.3, #654).
+    static FILES: RefCell<Files<DirId>> = const { RefCell::new(Files::new()) };
     /// Inodes in an integrity directory whose host sync failed while encfs
     /// held no state for them (A3, 6.5): every state filed for them later is
     /// fail-stopped, no birth runs on them, and a further sync of them is
@@ -386,31 +388,14 @@ pub struct File {
 }
 
 impl Drop for File {
-    /// The last descriptor of a clean file drops its state (6.1); a dirty or
-    /// fail-stopped file keeps it, so no `pending` bit and no fail-stop is
-    /// lost (6.6 (c), (d)).
+    /// The last descriptor of a clean file drops its state (6.1) and keeps
+    /// its cached size (5.3, #654); a dirty or fail-stopped file keeps its
+    /// state, so no `pending` bit and no fail-stop is lost (6.6 (c), (d)).
     fn drop(&mut self) {
         let Some((id, state)) = self.state.get_mut().take() else {
             return;
         };
-        let keep = {
-            let state = state.borrow();
-            state.is_dirty() || state.has_failed()
-        };
-        if keep {
-            return;
-        }
-        FILES.with(|files| {
-            let mut files = files.borrow_mut();
-            // Only this descriptor and the map hold it.
-            if files
-                .get(&id)
-                .is_some_and(|filed| Rc::ptr_eq(filed, &state))
-                && Rc::strong_count(&state) == 2
-            {
-                files.remove(&id);
-            }
-        });
+        FILES.with(|files| files.borrow_mut().close(id, &state));
     }
 }
 
@@ -538,6 +523,7 @@ impl File {
         if is_fail_stopped(&id) {
             return Err(slot_error(&self.path, SlotError::FailStopped));
         }
+        FILES.with(|files| files.borrow_mut().forget(&id));
         let file_id: FileId = random();
         let dek = Zeroizing::new(random::<DEK_LEN>());
         let header = Header::seal(kek, Codec::TwoSlotAead, &file_id, &dek, &random());
@@ -556,7 +542,7 @@ impl File {
             .insert(*header.as_bytes(), cipher.clone());
         *self.cipher.borrow_mut() = Some(cipher.clone());
         let filed = Rc::new(RefCell::new(born));
-        FILES.with(|files| files.borrow_mut().insert(id, filed.clone()));
+        FILES.with(|files| files.borrow_mut().file(id, filed.clone()));
         *self.state.borrow_mut() = Some((id, filed));
         match failure {
             Some(error) => Err(host(error)),
@@ -571,12 +557,11 @@ impl File {
             return Ok(state.clone());
         }
         let id = self.host_id()?;
-        let filed = FILES
-            .with(|files| files.borrow().get(&id).cloned())
-            .filter(|state| state.borrow().file_id() == file_id);
+        let filed = FILES.with(|files| files.borrow().get(&id, file_id));
         let state = match filed {
             Some(state) => state,
             None => {
+                FILES.with(|files| files.borrow_mut().invalidate_size(&id));
                 let storage = HostStorage(&self.host);
                 let layout = SlotFile {
                     keys,
@@ -586,7 +571,7 @@ impl File {
                 .layout()
                 .map_err(|e| slot_error(&self.path, e))?;
                 let state = Rc::new(RefCell::new(FileState::loaded(file_id, layout)));
-                FILES.with(|files| files.borrow_mut().insert(id, state.clone()));
+                FILES.with(|files| files.borrow_mut().file(id, state.clone()));
                 state
             }
         };
@@ -699,7 +684,11 @@ impl File {
             return Err(ErrorCode::BadDescriptor);
         }
         if self.mode == Mode::Integrity {
-            self.integrity(size > 0, |f| f.set_size(size))?;
+            if self.integrity(size > 0, |f| f.set_size(size))?.is_none() {
+                if let Ok(id) = self.host_id() {
+                    FILES.with(|files| files.borrow_mut().cache_size(id, 0));
+                }
+            }
             return Ok(());
         }
         let cipher = match self.cipher()? {
@@ -738,9 +727,9 @@ impl File {
             None => {
                 let id = self.host_id()?;
                 let filed = match self.cipher()?.as_deref() {
-                    Some(FileCipher::Slots { file_id, .. }) => FILES
-                        .with(|files| files.borrow().get(&id).cloned())
-                        .filter(|state| state.borrow().file_id() == *file_id),
+                    Some(FileCipher::Slots { file_id, .. }) => {
+                        FILES.with(|files| files.borrow().get(&id, *file_id))
+                    }
                     _ => None,
                 };
                 (id, filed)
@@ -781,7 +770,7 @@ fn doomed_inode(dir: &hfs::Descriptor, path: &str) -> Option<DirId> {
 
 fn forget_inode(id: Option<DirId>) {
     if let Some(id) = id {
-        FILES.with(|files| files.borrow_mut().remove(&id));
+        FILES.with(|files| files.borrow_mut().forget(&id));
         FAIL_STOPPED.with(|failed| failed.borrow_mut().forget(&id));
     }
 }
@@ -1309,7 +1298,12 @@ impl Descriptor {
 
     /// The logical size of the regular file at `path` in an integrity
     /// directory: codec-4 sizes need the file's slots (design note 5.3).
-    fn integrity_size_at(&self, path_flags: xfs::PathFlags, path: &str) -> R<u64> {
+    fn integrity_size_at(
+        &self,
+        path_flags: xfs::PathFlags,
+        path: &str,
+        id: Option<DirId>,
+    ) -> R<u64> {
         let fd = self
             .host()
             .open_at(
@@ -1319,13 +1313,17 @@ impl Descriptor {
                 hfs::DescriptorFlags::READ,
             )
             .map_err(host)?;
-        File::new(
+        let size = File::new(
             fd,
             xfs::DescriptorFlags::READ,
             path.to_string(),
             Mode::Integrity,
         )
-        .size()
+        .size()?;
+        if let Some(id) = id {
+            FILES.with(|files| files.borrow_mut().cache_size(id, size));
+        }
+        Ok(size)
     }
 }
 
@@ -1534,15 +1532,16 @@ impl xfs::GuestDescriptor for Descriptor {
             .map(guest_stat)
             .map_err(host)?;
         if self.mode() == Mode::Integrity && stat.type_ == xfs::DescriptorType::RegularFile {
-            // A file in use: its state has the size (5.3).
-            let filed = self
+            // A file in use or already stat'ed: its size is cached by host identity (5.3).
+            let id = self
                 .host()
                 .metadata_hash_at(host_path_flags(path_flags), &path)
                 .ok()
-                .and_then(|hash| FILES.with(|files| files.borrow().get(&dir_id(hash)).cloned()));
-            let size = match filed {
-                Some(state) => state.borrow().size(),
-                None => self.integrity_size_at(path_flags, &path)?,
+                .map(dir_id);
+            let cached = id.and_then(|id| FILES.with(|files| files.borrow_mut().size(&id)));
+            let size = match cached {
+                Some(size) => size,
+                None => self.integrity_size_at(path_flags, &path, id)?,
             };
             return Ok(xfs::DescriptorStat { size, ..stat });
         }

@@ -20,7 +20,9 @@
 //!   syncs (clears `synced_once`, so the next write runs W0) rather than
 //!   guessing.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use crate::file::{Storage, FILL_CHUNK, MAX_GAP, MAX_SIZE};
 use crate::header::{FileId, NONCE_LEN};
@@ -32,6 +34,10 @@ use crate::slots::{
 /// Pairs the watermark verifies per successful sync while `D` catches up
 /// (5.6 step 2): 4 MiB of reads.
 pub const VERIFY_PER_SYNC: u64 = 256;
+
+/// Maximum number of inodes without an open descriptor whose codec-4
+/// logical size is kept in [`SizeCache`] (5.3, #654).
+pub const SIZE_CACHE_CAPACITY: usize = 4096;
 
 /// The host's `sync-data` and `sync` on the file being written.
 pub trait Durable: Storage {
@@ -283,6 +289,172 @@ impl<Id: Ord> FailStops<Id> {
             self.stop(id);
             SlotError::Storage(error)
         })
+    }
+}
+
+/// Bounded LRU cache of codec-4 logical sizes for inodes with no state in
+/// [`Files`] (5.3, #654).
+#[derive(Debug)]
+pub struct SizeCache<Id: Ord> {
+    capacity: usize,
+    tick: u64,
+    entries: BTreeMap<Id, (u64, u64)>,
+    order: BTreeMap<u64, Id>,
+}
+
+impl<Id: Ord + Clone> Default for SizeCache<Id> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Id: Ord + Clone> SizeCache<Id> {
+    pub const fn new() -> Self {
+        Self::with_capacity(SIZE_CACHE_CAPACITY)
+    }
+
+    pub const fn with_capacity(capacity: usize) -> Self {
+        SizeCache {
+            capacity,
+            tick: 0,
+            entries: BTreeMap::new(),
+            order: BTreeMap::new(),
+        }
+    }
+
+    pub fn get(&mut self, id: &Id) -> Option<u64> {
+        let &(size, prev) = self.entries.get(id)?;
+        if prev == self.tick {
+            return Some(size);
+        }
+        let id = self.order.remove(&prev).expect("order matches entries");
+        self.tick += 1;
+        self.entries.insert(id.clone(), (size, self.tick));
+        self.order.insert(self.tick, id);
+        Some(size)
+    }
+
+    pub fn insert(&mut self, id: Id, size: u64) {
+        if self.capacity == 0 || self.entries.get(&id) == Some(&(size, self.tick)) {
+            return;
+        }
+        if let Some((_, prev)) = self.entries.remove(&id) {
+            self.order.remove(&prev);
+        } else if self.entries.len() == self.capacity {
+            if let Some((_, oldest)) = self.order.pop_first() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.tick += 1;
+        self.order.insert(self.tick, id.clone());
+        self.entries.insert(id, (size, self.tick));
+    }
+
+    pub fn forget(&mut self, id: &Id) {
+        if let Some((_, prev)) = self.entries.remove(id) {
+            self.order.remove(&prev);
+        }
+    }
+}
+
+/// The per-file states of codec-4 inodes in use (6.1), paired with a
+/// bounded size cache for inodes that no descriptor holds open (5.3, #654).
+#[derive(Debug)]
+pub struct Files<Id: Ord> {
+    open: BTreeMap<Id, Rc<RefCell<FileState>>>,
+    sizes: SizeCache<Id>,
+}
+
+impl<Id: Ord + Clone> Default for Files<Id> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Id: Ord + Clone> Files<Id> {
+    pub const fn new() -> Self {
+        Self::with_size_capacity(SIZE_CACHE_CAPACITY)
+    }
+
+    pub const fn with_size_capacity(capacity: usize) -> Self {
+        Files {
+            open: BTreeMap::new(),
+            sizes: SizeCache::with_capacity(capacity),
+        }
+    }
+
+    /// The filed state of `id` when its `file_id` matches.
+    pub fn get(&self, id: &Id, file_id: FileId) -> Option<Rc<RefCell<FileState>>> {
+        self.open
+            .get(id)
+            .cloned()
+            .filter(|state| state.borrow().file_id() == file_id)
+    }
+
+    /// File `state` under `id`, dropping any cached closed-file size.
+    pub fn file(&mut self, id: Id, state: Rc<RefCell<FileState>>) {
+        self.sizes.forget(&id);
+        self.open.insert(id, state);
+    }
+
+    /// Drop a descriptor's reference to `state` (6.1, 6.6 (c), (d)): when
+    /// the last descriptor of a clean file closes while its state is still
+    /// filed under `id`, drop the state and cache its logical size (5.3,
+    /// #654).
+    pub fn close(&mut self, id: Id, state: &Rc<RefCell<FileState>>) {
+        let (keep, reload, size) = {
+            let state = state.borrow();
+            (
+                state.is_dirty() || state.has_failed(),
+                state.reload,
+                state.size(),
+            )
+        };
+        if keep {
+            return;
+        }
+        // Only the closing descriptor and `open` hold it.
+        if self
+            .open
+            .get(&id)
+            .is_some_and(|filed| Rc::ptr_eq(filed, state))
+            && Rc::strong_count(state) == 2
+        {
+            self.open.remove(&id);
+            if !reload {
+                self.sizes.insert(id, size);
+            }
+        }
+    }
+
+    /// Look up the logical size of `id` in its filed state or in the
+    /// closed-file size cache (5.3, #654).
+    pub fn size(&mut self, id: &Id) -> Option<u64> {
+        if let Some(state) = self.open.get(id) {
+            let state = state.borrow();
+            return (!state.reload).then_some(state.size());
+        }
+        self.sizes.get(id)
+    }
+
+    /// Cache the logical `size` of an inode that has no state in `open`
+    /// (for example a fresh empty file stat'ed by path).
+    pub fn cache_size(&mut self, id: Id, size: u64) {
+        if !self.open.contains_key(&id) {
+            self.sizes.insert(id, size);
+        }
+    }
+
+    /// Drop any cached closed-file size for `id` before a reload.
+    pub fn invalidate_size(&mut self, id: &Id) {
+        self.sizes.forget(id);
+    }
+
+    /// The inode is gone (unlink or rename over its last link, 6.1): drop
+    /// both its state and any cached size.
+    pub fn forget(&mut self, id: &Id) {
+        self.open.remove(id);
+        self.sizes.forget(id);
     }
 }
 
@@ -1696,6 +1868,291 @@ mod tests {
         stops.forget(&7);
         assert_eq!(stops.stateless_sync(7, || rec.sync_data()), Ok(()));
         assert_eq!(rec.syncs.get(), 3);
+    }
+
+    #[test]
+    fn size_cache_bounds_entries_with_lru_eviction_and_forget() {
+        // #654: `SizeCache` is bounded, evicts the least-recently-used
+        // inode at capacity, refreshes recency on `get` and `insert`, and
+        // drops entries on `forget`.
+        let mut zero = SizeCache::with_capacity(0);
+        zero.insert(1u64, 100);
+        assert_eq!(zero.get(&1), None);
+
+        let mut cache = SizeCache::with_capacity(2);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        // Repeat hits on the most-recent and older entries refresh recency.
+        assert_eq!(cache.get(&2), Some(20));
+        assert_eq!(cache.get(&1), Some(10));
+        // Inserting 3 evicts 2 (now least-recently used), keeping 1.
+        cache.insert(3, 30);
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&1), Some(10));
+        assert_eq!(cache.get(&3), Some(30));
+        // Updating an existing entry refreshes its value and recency without
+        // evicting the other entry; re-inserting the same newest value is a no-op.
+        cache.insert(1, 15);
+        cache.insert(1, 15);
+        cache.insert(4, 40);
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(cache.get(&1), Some(15));
+        assert_eq!(cache.get(&4), Some(40));
+        // Forgetting an entry frees its slot.
+        cache.forget(&1);
+        cache.forget(&99);
+        assert_eq!(cache.get(&1), None);
+        cache.insert(5, 50);
+        assert_eq!(cache.get(&4), Some(40));
+        assert_eq!(cache.get(&5), Some(50));
+
+        let mut default_cache: SizeCache<u64> = SizeCache::default();
+        default_cache.insert(1, 42);
+        assert_eq!(default_cache.get(&1), Some(42));
+    }
+
+    #[test]
+    fn stat_at_on_a_closed_file_hits_the_cache_and_mutations_invalidate_it() {
+        // #654, 5.3: a `stat-at` on a codec-4 file nobody holds open loads
+        // the layout once, caches the size when the temporary descriptor
+        // closes, and serves repeated `stat-at` calls without reading
+        // storage; writes, resizes, truncates, failed shrinks, unlinks and
+        // renames invalidate or update the cached size.
+        let mut bench = Bench::born();
+        bench.write(0, &pattern(U + 123, 1)).unwrap();
+        bench.sync().unwrap();
+
+        let mut files: Files<(u64, u64)> = Files::default();
+        let id = (10, 20);
+
+        // Simulate `stat-at` by path on `id`: check `files.size(&id)`, and
+        // on a miss open a temporary descriptor, load `FileState` from
+        // `bench.rec`, read its size, and close the temporary descriptor.
+        let stat_at = |files: &mut Files<(u64, u64)>, bench: &Bench, id: (u64, u64)| {
+            if let Some(size) = files.size(&id) {
+                return Ok(size);
+            }
+            files.invalidate_size(&id);
+            let layout = SlotFile {
+                keys: &bench.keys,
+                file_id: FILE_ID,
+                storage: &bench.rec,
+            }
+            .layout()?;
+            let state = Rc::new(RefCell::new(FileState::loaded(FILE_ID, layout)));
+            files.file(id, state.clone());
+            let size = state.borrow().size();
+            files.close(id, &state);
+            Ok::<u64, SlotError<()>>(size)
+        };
+
+        // Cold `stat-at` reads the header/records and last pair, then caches.
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(UNIT + 123));
+        assert!(files.get(&id, FILE_ID).is_none(), "clean state was dropped");
+        // Repeated `stat-at` while nobody holds the file open hits the cache
+        // without touching storage (`reads_fail` would fail any storage read).
+        bench.rec.reads_fail.set(10);
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(UNIT + 123));
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(UNIT + 123));
+        assert_eq!(bench.rec.reads_fail.replace(0), 10, "no storage read ran");
+
+        // A fresh (0-byte) file cached by `integrity_size_at` / `set_size(0)`
+        // also hits on repeat and is replaced on birth.
+        let fresh_id = (11, 22);
+        files.cache_size(fresh_id, 0);
+        assert_eq!(files.size(&fresh_id), Some(0));
+        files.forget(&fresh_id);
+        assert_eq!(files.size(&fresh_id), None);
+
+        // Open the file with two descriptors, write through one (`pwrite` /
+        // stream write / append): the cached closed size is dropped, `stat-at`
+        // sees the live size from `open`, and closing one descriptor while the
+        // other is open keeps the state in `open`.
+        files.invalidate_size(&id);
+        let layout = SlotFile {
+            keys: &bench.keys,
+            file_id: FILE_ID,
+            storage: &bench.rec,
+        }
+        .layout()
+        .unwrap();
+        let fd1 = Rc::new(RefCell::new(FileState::loaded(FILE_ID, layout)));
+        files.file(id, fd1.clone());
+        let fd2 = files.get(&id, FILE_ID).expect("shared state");
+        // `cache_size` never overwrites an open file's state.
+        files.cache_size(id, 999_999);
+        {
+            let mut state = fd1.borrow_mut();
+            IntegrityFile {
+                file: SlotFile {
+                    keys: &bench.keys,
+                    file_id: FILE_ID,
+                    storage: &bench.rec,
+                },
+                state: &mut state,
+                nonces: &mut bench.nonces,
+                writable: true,
+            }
+            .write(UNIT + 123, b"more-bytes")
+            .unwrap();
+        }
+        let grown = UNIT + 133;
+        assert_eq!(files.size(&id), Some(grown));
+        // Closing `fd2` and `fd1` while dirty keeps the state in `open`.
+        files.close(id, &fd2);
+        drop(fd2);
+        files.close(id, &fd1);
+        drop(fd1);
+        assert!(
+            files.get(&id, FILE_ID).is_some(),
+            "dirty state stays in open"
+        );
+        bench.rec.reads_fail.set(10);
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(grown));
+        bench.rec.reads_fail.set(0);
+
+        // Syncing and closing the last descriptor moves the updated size into
+        // `sizes`, so a closed `stat-at` returns `grown` with no storage reads.
+        let fd = files.get(&id, FILE_ID).unwrap();
+        {
+            let mut state = fd.borrow_mut();
+            IntegrityFile {
+                file: SlotFile {
+                    keys: &bench.keys,
+                    file_id: FILE_ID,
+                    storage: &bench.rec,
+                },
+                state: &mut state,
+                nonces: &mut bench.nonces,
+                writable: true,
+            }
+            .sync(false)
+            .unwrap();
+        }
+        files.close(id, &fd);
+        drop(fd);
+        assert!(files.get(&id, FILE_ID).is_none());
+        bench.rec.reads_fail.set(10);
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(grown));
+        assert_eq!(bench.rec.reads_fail.replace(0), 10);
+
+        // `set_size` shrink and truncate (`open_at` with `TRUNCATE` ->
+        // `set_size(0)`) invalidate the old cached size and cache the new one.
+        for target_size in [500u64, 0] {
+            let layout = SlotFile {
+                keys: &bench.keys,
+                file_id: FILE_ID,
+                storage: &bench.rec,
+            }
+            .layout()
+            .unwrap();
+            let fd = Rc::new(RefCell::new(FileState::loaded(FILE_ID, layout)));
+            files.file(id, fd.clone());
+            {
+                let mut state = fd.borrow_mut();
+                IntegrityFile {
+                    file: SlotFile {
+                        keys: &bench.keys,
+                        file_id: FILE_ID,
+                        storage: &bench.rec,
+                    },
+                    state: &mut state,
+                    nonces: &mut bench.nonces,
+                    writable: true,
+                }
+                .set_size(target_size)
+                .unwrap();
+                if state.is_dirty() {
+                    IntegrityFile {
+                        file: SlotFile {
+                            keys: &bench.keys,
+                            file_id: FILE_ID,
+                            storage: &bench.rec,
+                        },
+                        state: &mut state,
+                        nonces: &mut bench.nonces,
+                        writable: true,
+                    }
+                    .sync(false)
+                    .unwrap();
+                }
+            }
+            assert_eq!(files.size(&id), Some(target_size));
+            files.close(id, &fd);
+            drop(fd);
+            bench.rec.reads_fail.set(10);
+            assert_eq!(stat_at(&mut files, &bench, id), Ok(target_size));
+            assert_eq!(bench.rec.reads_fail.replace(0), 10);
+        }
+
+        // A failed `set_len` during shrink marks `reload`: `files.size`
+        // refuses the uncertain size and `close` does not cache it.
+        bench.state = FileState::loaded(
+            FILE_ID,
+            SlotFile {
+                keys: &bench.keys,
+                file_id: FILE_ID,
+                storage: &bench.rec,
+            }
+            .layout()
+            .unwrap(),
+        );
+        bench.write(0, &pattern(2 * U, 9)).unwrap();
+        bench.sync().unwrap();
+        let fd = Rc::new(RefCell::new(bench.state.clone()));
+        files.file(id, fd.clone());
+        bench.rec.fail_set_len.set(Some(true));
+        {
+            let mut state = fd.borrow_mut();
+            assert_eq!(
+                IntegrityFile {
+                    file: SlotFile {
+                        keys: &bench.keys,
+                        file_id: FILE_ID,
+                        storage: &bench.rec,
+                    },
+                    state: &mut state,
+                    nonces: &mut bench.nonces,
+                    writable: true,
+                }
+                .set_size(0),
+                Err(SlotError::Storage(()))
+            );
+        }
+        assert_eq!(files.size(&id), None);
+        files.close(id, &fd);
+        drop(fd);
+        assert_eq!(files.size(&id), None);
+        // Next `stat-at` reloads the true post-truncate size (0) from storage.
+        assert_eq!(stat_at(&mut files, &bench, id), Ok(0));
+        assert_eq!(files.size(&id), Some(0));
+
+        // `forget` (`unlink_file_at` and `rename_at` over an inode) drops a
+        // closed file's cached size, and if called while a descriptor is still
+        // open, closing that descriptor later does not re-cache the unlinked
+        // inode's size.
+        files.forget(&id);
+        assert_eq!(files.size(&id), None);
+        let fd = Rc::new(RefCell::new(FileState::loaded(
+            FILE_ID,
+            SlotFile {
+                keys: &bench.keys,
+                file_id: FILE_ID,
+                storage: &bench.rec,
+            }
+            .layout()
+            .unwrap(),
+        )));
+        files.file(id, fd.clone());
+        files.forget(&id);
+        assert_eq!(files.size(&id), None);
+        files.close(id, &fd);
+        drop(fd);
+        assert_eq!(
+            files.size(&id),
+            None,
+            "closing an unlinked descriptor must not re-populate the size cache"
+        );
     }
 
     #[test]
