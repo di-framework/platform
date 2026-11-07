@@ -290,8 +290,8 @@ The existing `tenant-storage-records` ValidatingAdmissionPolicy checks `kept(a, 
 )
 ```
 
-- **Monotonicity:** Once an anchor is recorded on a key, it can never be removed while the key entry exists, `restoreGeneration` can never decrease, and within the same `restoreGeneration`, `seq` can never decrease (`b.anchor.seq >= a.anchor.seq`), nor can `rootHash` or `kcv` change at the same `seq` (fork detection).
-- **Restore exception:** `(seq, rootHash)` may be replaced with a restored backup's `(encfsSeq, encfsRootHash)` **if and only if** the control-plane `restoreGeneration` counter increments by 1 with a fresh `lastRestoreUid` (section 6.2). Once re-anchored, `anchor.seq` and `anchor.rootHash` in `Tenant.status` equal the restored backup's on-disk `seq` and `root_hash`, so subsequent boots and `pglite-encfs` flushes (`seq + 1, seq + 2, ...`) satisfy `b.anchor.seq >= a.anchor.seq` under the new `restoreGeneration`.
+- **Monotonicity and key rotation:** Once an anchor is recorded on a key, it can never be removed while the key entry exists, `restoreGeneration` can never decrease, and within the same `restoreGeneration`, `seq` can never decrease (`b.anchor.seq >= a.anchor.seq`). At equal `seq` (`b.anchor.seq == a.anchor.seq`), neither `rootHash` nor `kcv` can change (`b.anchor.rootHash == a.anchor.rootHash && b.anchor.kcv == a.anchor.kcv`, fork detection). When `seq` strictly advances (`b.anchor.seq > a.anchor.seq`), `kcv` may either remain `a.anchor.kcv` or advance to `current.kcv()` following an in-place key rotation (§3.1, §5.4).
+- **Restore exception:** `(kcv, seq, rootHash)` may be replaced with a restored backup's `(encfsKcv, encfsSeq, encfsRootHash)` **if and only if** the control-plane `restoreGeneration` counter increments by 1 with a fresh `lastRestoreUid` (section 6.2). Once re-anchored, `anchor.kcv`, `anchor.seq`, and `anchor.rootHash` in `Tenant.status` equal the restored backup's on-disk `kcv`, `seq`, and `root_hash`, so subsequent boots and `pglite-encfs` flushes (`seq + 1, seq + 2, ...`) satisfy `b.anchor.seq >= a.anchor.seq` under the new `restoreGeneration`.
 - **CEL cost budget:** Still a single linear `.all(k, ...)` pass over `status.storage.keys` with constant-time field comparisons per key (`design-200` §9.1 S3).
 
 ---
@@ -372,14 +372,16 @@ How frequently is the on-disk `(kcv, seq, root_hash)` of `.di-encfs-state` copie
 
 1. **Baseline: Pod-lifecycle boot/restart fence (`storage-mode` init step):**
    - Whenever the tenant host pod starts or restarts, the `storage-mode` init container (`platform/platform/src/tenancy/storage-mode.ts`, `platform/platform/src/tenancy/workload-storage.ts:170-195`) runs before the host container starts.
-   - The controller passes the current recorded anchors via `--anchors=<key>:<kcv>:<seq>:<rootHash>,...`.
+   - The controller passes the current recorded anchors (plus the active `currentKcv` when a key rotation is configured for `key`) via `--anchors=<key>:<kcv>:<seq>:<rootHash>[:<currentKcv>],...`.
    - For each `aead` directory:
      - `storage-mode` opens `.di-encfs-state` with `O_RDONLY | O_NOFOLLOW`, verifies with `fstat` that it is a regular file of at least 144 bytes (`HEADER_LEN + NONCE_LEN + TAG_LEN`), and parses the 104-byte header (`DIPGRB01`, `version`, `flags`, `reserved`, `kcv`, `seq`, `prev_root_hash`, `root_hash`).
      - If an anchor was passed for `key`:
-       - If `.di-encfs-state` is missing, malformed, has `kcv != anchor.kcv`, has `seq < anchor.seq`, or has `seq == anchor.seq && root_hash != anchor.rootHash`, `storage-mode` reports `<key> aead rollback expected_seq=<anchor.seq> found_seq=<seq>`, writes the failure to `/dev/termination-log`, and **exits 1**.
+       - At equal `seq` (`seq == anchor.seq`), `storage-mode` requires **`root_hash == anchor.rootHash && kcv == anchor.kcv`**.
+       - At higher `seq` (`seq > anchor.seq`), `storage-mode` requires **`kcv ∈ {anchor.kcv, currentKcv}`** (where `currentKcv` is the active key's KCV when key rotation is configured, or `anchor.kcv` otherwise — preventing cross-key directory swaps to an unrelated key at higher `seq` while allowing `pglite-encfs` key rotation in §3.1 to advance `seq` and update `kcv` to `current.kcv()`).
+       - If `.di-encfs-state` is missing, malformed, has `seq < anchor.seq`, fails the `seq == anchor.seq` check, or has `kcv ∉ {anchor.kcv, currentKcv}` at `seq > anchor.seq`, `storage-mode` reports `<key> aead rollback expected_seq=<anchor.seq> found_seq=<seq>`, writes the failure to `/dev/termination-log`, and **exits 1**.
        - Because `storage-mode` is an init container, **the tenant host pod refuses to start**, no guest ever touches the rolled-back directory, and the controller sets `StorageIntegrity = False` with reason `RollbackDetected`.
-     - If `kcv == anchor.kcv` and `(seq > anchor.seq || (seq == anchor.seq && root_hash == anchor.rootHash))`, `storage-mode` prints `<key> aead seq=<seq> root=<root_hash> kcv=<kcv>` in its stdout listing.
-     - The controller reads the listing via `pods/log` (`platform/platform/src/tenancy/controller.ts:2008-2068`) and advances `Tenant.status.storage.keys[key].anchor` (`seq` and `rootHash`, keeping the existing `restoreGeneration` and `lastRestoreUid`).
+     - When `(seq == anchor.seq && root_hash == anchor.rootHash && kcv == anchor.kcv) || (seq > anchor.seq && kcv ∈ {anchor.kcv, currentKcv})`, `storage-mode` prints `<key> aead seq=<seq> root=<root_hash> kcv=<kcv>` in its stdout listing.
+     - The controller reads the listing via `pods/log` (`platform/platform/src/tenancy/controller.ts:2008-2068`) and advances `Tenant.status.storage.keys[key].anchor` (`kcv`, `seq`, and `rootHash`, keeping the existing `restoreGeneration` and `lastRestoreUid`).
    - **What the boot fence catches:** Any offline volume rollback, snapshot revert while stopped, or snapshot revert followed by a pod restart, once at least one pod restart has anchored the state.
 2. **Closing the single-pod lifetime window: Periodic controller / checkpoint witness:**
    - As `design-200` §9.1 ("Freshness") notes, tenant host pods are long-lived. If a directory is created and runs for days in a single host pod without restarting, `storage-mode` has only run once (when the directory was `reserved` before `.di-encfs-state` existed). If an attacker reverts the underlying volume snapshot and kills the pod, `anchor` would still be unset unless the controller also witnesses `.di-encfs-state` while the pod is running!
@@ -495,7 +497,7 @@ sequenceDiagram
         - It updates the `di-storage-records` ConfigMap in `di-runtime-<tenant>`.
      3. On the next tick of `backup-destination`, `advance` sees that `world.storageRecords.keys[key].anchor?.lastRestoreUid === restore.objectUid`, releases the `held-replicas` ledger entries, scales the target `WorkloadDeployment` back up, and marks the `BackupRestore` `Succeeded`.
    - **How `storage-mode`, `storage-witness`, and `pglite-encfs` operate after the restore:**
-     - Because `anchor.seq` (`40`) and `anchor.rootHash` (`H_40`) in `Tenant.status` now equal the restored `.di-encfs-state`'s `seq` (`40`) and `root_hash` (`H_40`), `storage-mode` and `storage-witness` apply the single invariant `onDisk.kcv == anchor.kcv && (onDisk.seq > anchor.seq || (onDisk.seq == anchor.seq && onDisk.root_hash == anchor.rootHash))` with zero special cases.
+     - Because `anchor.kcv`, `anchor.seq` (`40`), and `anchor.rootHash` (`H_40`) in `Tenant.status` now equal the restored `.di-encfs-state`'s `(kcv, seq, root_hash)`, `storage-mode` and `storage-witness` apply the single invariant `(onDisk.seq == anchor.seq && onDisk.root_hash == anchor.rootHash && onDisk.kcv == anchor.kcv) || (onDisk.seq > anchor.seq && onDisk.kcv ∈ {anchor.kcv, currentKcv})` with zero special cases.
      - When `pglite-encfs` opens the restored directory (`open_root`), it verifies the Poly1305 tag of `.di-encfs-state` under `K_rb` (which `backup-agent` and `storage-mode` could not verify without `DI_PGLITE_KEY`) and stamps the next manifest flush at `seq = 41` with `prev_root_hash = H_40`.
 
 4. **Why an attacker cannot abuse the restore path:**
