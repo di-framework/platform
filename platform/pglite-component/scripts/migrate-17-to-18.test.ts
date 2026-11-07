@@ -127,7 +127,7 @@ describe('validateMigrationDirs', () => {
           currentComposed: join(base, 'missing-curr.wasm'),
           workDir,
         }),
-      ).rejects.toThrow('wasmtime export-sql failed');
+      ).rejects.toThrow(/wasmtime export-sql failed|Executable not found in \$PATH: "wasmtime"/);
 
       expect(existsSync(toDir)).toBe(false);
     } finally {

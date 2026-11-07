@@ -702,8 +702,15 @@ fn upgrade_write(db: &Connection) {
         &[Value::Text("item-one".into())],
     )
     .expect("insert upgrade_items");
-    db.exec("CREATE INDEX upgrade_items_label_idx ON upgrade_items (label)")
-        .expect("create upgrade_items_label_idx");
+    db.exec(
+        "CREATE FUNCTION upgrade_greeting(name text) RETURNS text \
+         LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN 'hello ' || name; END $$",
+    )
+    .expect("create upgrade_greeting");
+    db.exec(
+        "CREATE INDEX upgrade_items_label_idx ON upgrade_items (label, (upgrade_greeting(label)))",
+    )
+    .expect("create upgrade_items_label_idx");
     db.exec(
         "CREATE VIEW upgrade_summary AS \
          SELECT c.id, c.payload, i.label, i.upper_label \
@@ -711,10 +718,10 @@ fn upgrade_write(db: &Connection) {
     )
     .expect("create upgrade_summary view");
     db.exec(
-        "CREATE FUNCTION upgrade_greeting(name text) RETURNS text \
-         LANGUAGE plpgsql AS $$ BEGIN RETURN 'hello ' || name; END $$",
+        "CREATE VIEW a_dependent_summary AS \
+         SELECT id, label, upper_label FROM upgrade_summary",
     )
-    .expect("create upgrade_greeting");
+    .expect("create dependent view a_dependent_summary");
     db.exec("CHECKPOINT").expect("checkpoint upgrade_write");
 }
 
@@ -802,6 +809,7 @@ fn export_sql_mode() {
             );
         }
         db.close().expect("close empty-check database");
+        println!("sibling database public schema is empty");
         return;
     }
 
@@ -849,7 +857,8 @@ fn export_sql_mode() {
         panic!("unsupported public objects cannot be migrated automatically: {items}");
     }
 
-    let mut out = String::from("-- di-framework:pglite logical export\n");
+    let mut out =
+        String::from("-- di-framework:pglite logical export\nSET check_function_bodies = false;\n");
 
     let exts = db
         .query(
@@ -863,7 +872,7 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    // Export standalone and serial sequences before tables (identity sequences
+    // Export standalone and serial sequences before functions and tables (identity sequences
     // have deptype = 'i' and are created by `GENERATED ... AS IDENTITY` on the table).
     let seqs = db
         .query(
@@ -890,6 +899,28 @@ fn export_sql_mode() {
         )
         .expect("query sequences");
     for row in seqs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Export user-defined functions before tables, indexes, and views so column
+    // defaults, CHECK constraints, generated columns, expression indexes, and views
+    // can reference them (`check_function_bodies` is disabled above).
+    let funcs = db
+        .query(
+            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY p.proname, p.oid",
+            &[],
+        )
+        .expect("query functions");
+    for row in funcs {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
     }
@@ -1052,37 +1083,45 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    let funcs = db
-        .query(
-            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
-             FROM pg_proc p \
-             JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'public' \
-               AND p.prokind = 'f' \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
-               ) \
-             ORDER BY p.proname, p.oid",
-            &[],
-        )
-        .expect("query functions");
-    for row in funcs {
-        out.push_str(&text(col(&row, "stmt")));
-        out.push('\n');
-    }
-
+    // Order views topologically by view-on-view dependency depth over pg_rewrite/pg_depend.
     let views = db
         .query(
-            "SELECT format('CREATE OR REPLACE VIEW public.%I AS %s;', \
-                      c.relname, pg_get_viewdef(c.oid, true)) AS stmt \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = 'public' \
-               AND c.relkind = 'v' \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
-               ) \
-             ORDER BY c.relname",
+            "WITH RECURSIVE public_views AS ( \
+               SELECT c.oid, c.relname \
+               FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'public' \
+                 AND c.relkind = 'v' \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+                 ) \
+             ), \
+             view_edges AS ( \
+               SELECT DISTINCT v.oid AS child_oid, ref.oid AS parent_oid \
+               FROM public_views v \
+               JOIN pg_rewrite r ON r.ev_class = v.oid \
+               JOIN pg_depend d ON d.objid = r.oid \
+               JOIN public_views ref ON ref.oid = d.refobjid \
+               WHERE ref.oid <> v.oid \
+             ), \
+             view_depths AS ( \
+               SELECT v.oid, v.relname, 0 AS depth, ARRAY[v.oid] AS path \
+               FROM public_views v \
+               WHERE NOT EXISTS (SELECT 1 FROM view_edges e WHERE e.child_oid = v.oid) \
+               UNION ALL \
+               SELECT c.oid, c.relname, p.depth + 1, p.path || c.oid \
+               FROM view_depths p \
+               JOIN view_edges e ON e.parent_oid = p.oid \
+               JOIN public_views c ON c.oid = e.child_oid \
+               WHERE NOT (c.oid = ANY(p.path)) \
+             ) \
+             SELECT format('CREATE OR REPLACE VIEW public.%I AS %s;', \
+                           v.relname, pg_get_viewdef(v.oid, true)) AS stmt \
+             FROM public_views v \
+             LEFT JOIN ( \
+               SELECT oid, max(depth) AS depth FROM view_depths GROUP BY oid \
+             ) d ON d.oid = v.oid \
+             ORDER BY COALESCE(d.depth, 0), v.relname, v.oid",
             &[],
         )
         .expect("query views");
@@ -1195,6 +1234,14 @@ fn upgrade_read(db: &Connection) {
             &[]
         ),
         "ITEM-ONE"
+    );
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT upper_label FROM a_dependent_summary WHERE label = 'item-two'",
+            &[]
+        ),
+        "ITEM-TWO"
     );
 
     // The extension migrated from 17.5 resolves its functions in 18.6.
