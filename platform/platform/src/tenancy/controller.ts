@@ -1888,25 +1888,36 @@ export class Controller {
               (c) => c.type === 'Ready' && c.status === 'True',
             ),
         );
-        // A Host whose pod is terminating or gone is never a nudge target: the upstream
-        // scheduler would place Workloads on a host that is about to stop (#418).
-        const pods = await this.list<Resource>(
-          'v1',
-          'Pod',
-          { 'wasmcloud.com/hostgroup': n.hostgroup },
-          n.runtimeNamespace,
-        );
-        const liveIps = new Set(
-          pods.flatMap((p) => {
-            const ip = (p.status as { podIP?: string } | undefined)?.podIP;
-            return ip && !p.metadata.deletionTimestamp ? [ip] : [];
-          }),
-        );
-        await this.nudgeUnplaced(
-          n.namespace,
-          readyHosts.filter((h) => liveIps.has(h.hostname as string)),
-        );
         ready &&= readyHosts.length >= (tenant.spec.runtime?.replicas ?? 1);
+        // A Host whose pod is terminating, finished (e.g. evicted) or gone is never a nudge
+        // target: the upstream scheduler would place Workloads on a host that is about to stop
+        // or already dead (#418). Listed again after the applies so a pod deleted mid-tick is
+        // seen; best-effort like `nudgeUnplaced` itself.
+        let pods: Resource[] | undefined;
+        try {
+          pods = await this.list<Resource>(
+            'v1',
+            'Pod',
+            { 'wasmcloud.com/hostgroup': n.hostgroup },
+            n.runtimeNamespace,
+          );
+        } catch (error) {
+          console.warn(
+            `Placement nudge in ${n.namespace}: listing Pods failed: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+        if (pods) {
+          const liveIps = new Set(
+            pods.flatMap((p) => {
+              const ip = (p.status as { podIP?: string } | undefined)?.podIP;
+              return ip && isLivePod(p) && !p.metadata.deletionTimestamp ? [ip] : [];
+            }),
+          );
+          await this.nudgeUnplaced(
+            n.namespace,
+            readyHosts.filter((h) => liveIps.has(h.hostname as string)),
+          );
+        }
       } catch (error) {
         // Reported only when it decides readiness; a tenant that is not ready yet waits anyway.
         if (ready) failure ??= error;
