@@ -920,110 +920,13 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    const FUNC_STAGE_CTE: &str = "\
-        WITH RECURSIVE public_funcs AS ( \
-          SELECT p.oid, p.proname, pg_get_functiondef(p.oid) || ';' AS stmt \
-          FROM pg_proc p \
-          JOIN pg_namespace n ON n.oid = p.pronamespace \
-          WHERE n.nspname = 'public' \
-            AND p.prokind = 'f' \
-            AND NOT EXISTS ( \
-              SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
-            ) \
-        ), \
-        public_rels AS ( \
-          SELECT c.oid, c.relname, c.relkind, c.reltype \
-          FROM pg_class c \
-          JOIN pg_namespace n ON n.oid = c.relnamespace \
-          WHERE n.nspname = 'public' \
-            AND c.relkind IN ('r', 'p', 'f', 'v') \
-            AND NOT EXISTS ( \
-              SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
-            ) \
-        ), \
-        func_call_edges AS ( \
-          SELECT DISTINCT f.oid AS child_oid, ref.oid AS parent_oid \
-          FROM public_funcs f \
-          JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = f.oid \
-            AND d.refclassid = 'pg_proc'::regclass \
-          JOIN public_funcs ref ON ref.oid = d.refobjid \
-          WHERE ref.oid <> f.oid \
-        ), \
-        func_reach AS ( \
-          SELECT oid AS root_oid, oid AS reach_oid, ARRAY[oid] AS path \
-          FROM public_funcs \
-          UNION ALL \
-          SELECT r.root_oid, e.parent_oid, r.path || e.parent_oid \
-          FROM func_reach r \
-          JOIN func_call_edges e ON e.child_oid = r.reach_oid \
-          WHERE NOT (e.parent_oid = ANY(r.path)) \
-        ), \
-        func_direct_rels AS ( \
-          SELECT DISTINCT f.oid AS func_oid, rc.oid AS rel_oid, rc.relkind \
-          FROM public_funcs f \
-          JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = f.oid \
-          LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
-          JOIN public_rels rc ON ( \
-            (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
-            OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
-          ) \
-        ), \
-        func_stage AS ( \
-          SELECT f.oid, f.proname, f.stmt, \
-            CASE \
-              WHEN EXISTS ( \
-                SELECT 1 FROM func_reach r \
-                JOIN func_direct_rels dr ON dr.func_oid = r.reach_oid \
-                WHERE r.root_oid = f.oid AND dr.relkind = 'v' \
-              ) THEN 3 \
-              WHEN EXISTS ( \
-                SELECT 1 FROM func_reach r \
-                JOIN func_direct_rels dr ON dr.func_oid = r.reach_oid \
-                WHERE r.root_oid = f.oid AND dr.relkind IN ('r', 'p', 'f') \
-              ) THEN 2 \
-              ELSE 1 \
-            END AS stage \
-          FROM public_funcs f \
-        )";
-
-    let func_stage_query = format!(
-        "{FUNC_STAGE_CTE}, \
-         stage_funcs AS ( \
-           SELECT oid, proname, stmt FROM func_stage WHERE stage = $1::int8 \
-         ), \
-         stage_edges AS ( \
-           SELECT e.child_oid, e.parent_oid \
-           FROM func_call_edges e \
-           JOIN stage_funcs c ON c.oid = e.child_oid \
-           JOIN stage_funcs p ON p.oid = e.parent_oid \
-         ), \
-         stage_depths AS ( \
-           SELECT f.oid, 0 AS depth, ARRAY[f.oid] AS path \
-           FROM stage_funcs f \
-           WHERE NOT EXISTS (SELECT 1 FROM stage_edges e WHERE e.child_oid = f.oid) \
-           UNION ALL \
-           SELECT c.oid, p.depth + 1, p.path || c.oid \
-           FROM stage_depths p \
-           JOIN stage_edges e ON e.parent_oid = p.oid \
-           JOIN stage_funcs c ON c.oid = e.child_oid \
-           WHERE NOT (c.oid = ANY(p.path)) \
-         ) \
-         SELECT f.stmt AS stmt \
-         FROM stage_funcs f \
-         LEFT JOIN ( \
-           SELECT oid, max(depth) AS depth FROM stage_depths GROUP BY oid \
-         ) d ON d.oid = f.oid \
-         ORDER BY COALESCE(d.depth, 0), f.proname, f.oid"
-    );
+    let (stage1_funcs, stage2_funcs, stage3_views_and_funcs) = stage_functions_and_views(&db);
 
     // Function pass 1 (before tables): relation-free user functions (including
     // relation-free `BEGIN ATOMIC` functions) so column DEFAULTs, CHECK constraints,
     // and generated columns can reference them.
-    let early_funcs = db
-        .query(&func_stage_query, &[Value::Integer(1)])
-        .expect("query stage 1 functions");
-    for row in early_funcs {
-        out.push_str(&text(col(&row, "stmt")));
+    for stmt in stage1_funcs {
+        out.push_str(&stmt);
         out.push('\n');
     }
 
@@ -1160,13 +1063,10 @@ fn export_sql_mode() {
     }
 
     // Function pass 2 (after tables & FKs, before standalone indexes and views):
-    // functions that depend on `public` tables (`relkind IN ('r', 'p', 'f')`) but
-    // not on any `public` view (`relkind = 'v'`).
-    let table_funcs = db
-        .query(&func_stage_query, &[Value::Integer(2)])
-        .expect("query stage 2 functions");
-    for row in table_funcs {
-        out.push_str(&text(col(&row, "stmt")));
+    // functions that transitively depend on `public` tables (`relkind IN ('r', 'p', 'f')`)
+    // but not on any `public` view (`relkind = 'v'`).
+    for stmt in stage2_funcs {
+        out.push_str(&stmt);
         out.push('\n');
     }
 
@@ -1197,79 +1097,285 @@ fn export_sql_mode() {
     }
 
     // Pass 3: emit `public` views and view-dependent functions in unified topological
-    // dependency order over `pg_rewrite` and `pg_depend`, then restore `check_function_bodies`.
-    let stage3_query = format!(
-        "{FUNC_STAGE_CTE}, \
-         stage3_nodes AS ( \
-           SELECT 'v:' || r.oid::text AS node_id, 0 AS kind_order, r.relname AS name, r.oid AS oid, \
-                  format('CREATE OR REPLACE VIEW public.%I AS %s;', \
-                         r.relname, pg_get_viewdef(r.oid, true)) AS stmt \
-           FROM public_rels r \
-           WHERE r.relkind = 'v' \
-           UNION ALL \
-           SELECT 'f:' || f.oid::text AS node_id, 1 AS kind_order, f.proname AS name, f.oid AS oid, \
-                  f.stmt AS stmt \
-           FROM func_stage f \
-           WHERE f.stage = 3 \
-         ), \
-         stage3_edges AS ( \
-           SELECT DISTINCT 'v:' || v.oid::text AS child_id, \
-             CASE \
-               WHEN d.refclassid = 'pg_proc'::regclass THEN 'f:' || pf.oid::text \
-               ELSE 'v:' || pv.oid::text \
-             END AS parent_id \
-           FROM public_rels v \
-           JOIN pg_rewrite rw ON rw.ev_class = v.oid \
-           JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
-           LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
-           LEFT JOIN public_rels pv ON pv.relkind = 'v' AND pv.oid <> v.oid AND ( \
-             (d.refclassid = 'pg_class'::regclass AND pv.oid = d.refobjid) \
-             OR (d.refclassid = 'pg_type'::regclass AND (pv.oid = t.typrelid OR pv.reltype = t.typelem)) \
-           ) \
-           LEFT JOIN func_stage pf ON pf.stage = 3 \
-             AND d.refclassid = 'pg_proc'::regclass AND pf.oid = d.refobjid \
-           WHERE v.relkind = 'v' AND (pv.oid IS NOT NULL OR pf.oid IS NOT NULL) \
-           UNION \
-           SELECT DISTINCT 'f:' || f.oid::text AS child_id, 'v:' || dr.rel_oid::text AS parent_id \
-           FROM func_stage f \
-           JOIN func_direct_rels dr ON dr.func_oid = f.oid AND dr.relkind = 'v' \
-           WHERE f.stage = 3 \
-           UNION \
-           SELECT DISTINCT 'f:' || f.oid::text AS child_id, 'f:' || pf.oid::text AS parent_id \
-           FROM func_stage f \
-           JOIN func_call_edges e ON e.child_oid = f.oid \
-           JOIN func_stage pf ON pf.oid = e.parent_oid AND pf.stage = 3 \
-           WHERE f.stage = 3 \
-         ), \
-         stage3_depths AS ( \
-           SELECT n.node_id, 0 AS depth, ARRAY[n.node_id] AS path \
-           FROM stage3_nodes n \
-           WHERE NOT EXISTS (SELECT 1 FROM stage3_edges e WHERE e.child_id = n.node_id) \
-           UNION ALL \
-           SELECT c.node_id, p.depth + 1, p.path || c.node_id \
-           FROM stage3_depths p \
-           JOIN stage3_edges e ON e.parent_id = p.node_id \
-           JOIN stage3_nodes c ON c.node_id = e.child_id \
-           WHERE NOT (c.node_id = ANY(p.path)) \
-         ) \
-         SELECT n.stmt AS stmt \
-         FROM stage3_nodes n \
-         LEFT JOIN ( \
-           SELECT node_id, max(depth) AS depth FROM stage3_depths GROUP BY node_id \
-         ) d ON d.node_id = n.node_id \
-         ORDER BY COALESCE(d.depth, 0), n.kind_order, n.name, n.oid"
-    );
-    let views_and_funcs = db
-        .query(&stage3_query, &[])
-        .expect("query stage 3 views and functions");
-    for row in views_and_funcs {
-        out.push_str(&text(col(&row, "stmt")));
+    // dependency order, then restore `check_function_bodies`.
+    for stmt in stage3_views_and_funcs {
+        out.push_str(&stmt);
         out.push('\n');
     }
     out.push_str("SET check_function_bodies = true;\n");
 
     db.close().expect("close export-sql");
     std::fs::write(&dump_path, out).expect("write exported SQL dump");
+}
+
+/// Classify `public` functions and views into 3 stages and topologically sort each
+/// stage in $O(V + E)$ using BFS reachability and Kahn's algorithm in Rust.
+fn stage_functions_and_views(db: &Connection) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    struct Node {
+        is_func: bool,
+        oid: i64,
+        name: String,
+        stmt: String,
+        depends_on_table: bool,
+        depends_on_view: bool,
+    }
+
+    let node_rows = db
+        .query(
+            "SELECT true AS is_func, \
+                    p.oid::int8 AS oid, \
+                    p.proname AS name, \
+                    pg_get_functiondef(p.oid) || ';' AS stmt, \
+                    EXISTS ( \
+                      SELECT 1 \
+                      FROM pg_depend d \
+                      LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+                      JOIN pg_class rc ON ( \
+                        (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
+                        OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
+                      ) \
+                      JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                      WHERE d.classid = 'pg_proc'::regclass \
+                        AND d.objid = p.oid \
+                        AND rn.nspname = 'public' \
+                        AND rc.relkind IN ('r', 'p', 'f') \
+                    ) AS depends_on_table, \
+                    EXISTS ( \
+                      SELECT 1 \
+                      FROM pg_depend d \
+                      LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+                      JOIN pg_class rc ON ( \
+                        (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
+                        OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
+                      ) \
+                      JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                      WHERE d.classid = 'pg_proc'::regclass \
+                        AND d.objid = p.oid \
+                        AND rn.nspname = 'public' \
+                        AND rc.relkind = 'v' \
+                    ) AS depends_on_view \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+             UNION ALL \
+             SELECT false AS is_func, \
+                    v.oid::int8 AS oid, \
+                    v.relname AS name, \
+                    format('CREATE OR REPLACE VIEW public.%I AS %s;', \
+                           v.relname, pg_get_viewdef(v.oid, true)) AS stmt, \
+                    false AS depends_on_table, \
+                    true AS depends_on_view \
+             FROM pg_class v \
+             JOIN pg_namespace n ON n.oid = v.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND v.relkind = 'v' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = v.oid AND d.deptype = 'e' \
+               )",
+            &[],
+        )
+        .expect("query public functions and views");
+
+    let mut nodes = Vec::with_capacity(node_rows.len());
+    let mut node_index = BTreeMap::new();
+    for row in node_rows {
+        let is_func = matches!(col(&row, "is_func"), Value::Boolean(true));
+        let oid = int(col(&row, "oid"));
+        let name = text(col(&row, "name"));
+        let stmt = text(col(&row, "stmt"));
+        let depends_on_table = matches!(col(&row, "depends_on_table"), Value::Boolean(true));
+        let depends_on_view = matches!(col(&row, "depends_on_view"), Value::Boolean(true));
+        let idx = nodes.len();
+        node_index.insert((is_func, oid), idx);
+        nodes.push(Node {
+            is_func,
+            oid,
+            name,
+            stmt,
+            depends_on_table,
+            depends_on_view,
+        });
+    }
+
+    let edge_rows = db
+        .query(
+            "SELECT DISTINCT true AS child_is_func, \
+                    p.oid::int8 AS child_oid, \
+                    true AS parent_is_func, \
+                    ref_p.oid::int8 AS parent_oid \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_depend d ON d.classid = 'pg_proc'::regclass \
+               AND d.objid = p.oid \
+               AND d.refclassid = 'pg_proc'::regclass \
+             JOIN pg_proc ref_p ON ref_p.oid = d.refobjid \
+             JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND ref_n.nspname = 'public' \
+               AND ref_p.prokind = 'f' \
+               AND ref_p.oid <> p.oid \
+             UNION \
+             SELECT DISTINCT true AS child_is_func, \
+                    p.oid::int8 AS child_oid, \
+                    false AS parent_is_func, \
+                    v.oid::int8 AS parent_oid \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid \
+             LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+             JOIN pg_class v ON ( \
+               (d.refclassid = 'pg_class'::regclass AND v.oid = d.refobjid) \
+               OR (d.refclassid = 'pg_type'::regclass AND (v.oid = t.typrelid OR v.reltype = t.typelem)) \
+             ) \
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND vn.nspname = 'public' \
+               AND v.relkind = 'v' \
+             UNION \
+             SELECT DISTINCT false AS child_is_func, \
+                    v.oid::int8 AS child_oid, \
+                    CASE WHEN d.refclassid = 'pg_proc'::regclass THEN true ELSE false END AS parent_is_func, \
+                    CASE WHEN d.refclassid = 'pg_proc'::regclass THEN ref_p.oid::int8 ELSE ref_v.oid::int8 END AS parent_oid \
+             FROM pg_class v \
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace \
+             JOIN pg_rewrite rw ON rw.ev_class = v.oid \
+             JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
+             LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+             LEFT JOIN pg_class ref_v ON ref_v.relkind = 'v' AND ref_v.oid <> v.oid AND ( \
+               (d.refclassid = 'pg_class'::regclass AND ref_v.oid = d.refobjid) \
+               OR (d.refclassid = 'pg_type'::regclass AND (ref_v.oid = t.typrelid OR ref_v.reltype = t.typelem)) \
+             ) \
+             LEFT JOIN pg_namespace ref_vn ON ref_vn.oid = ref_v.relnamespace AND ref_vn.nspname = 'public' \
+             LEFT JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass \
+               AND ref_p.oid = d.refobjid \
+               AND ref_p.prokind = 'f' \
+             LEFT JOIN pg_namespace ref_pn ON ref_pn.oid = ref_p.pronamespace AND ref_pn.nspname = 'public' \
+             WHERE vn.nspname = 'public' \
+               AND v.relkind = 'v' \
+               AND (ref_vn.oid IS NOT NULL OR ref_pn.oid IS NOT NULL)",
+            &[],
+        )
+        .expect("query dependency edges");
+
+    // `children_of[parent]` holds all dependent child indices (`parent` must be created before `child`).
+    let mut children_of: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); nodes.len()];
+    for row in edge_rows {
+        let child_key = (
+            matches!(col(&row, "child_is_func"), Value::Boolean(true)),
+            int(col(&row, "child_oid")),
+        );
+        let parent_key = (
+            matches!(col(&row, "parent_is_func"), Value::Boolean(true)),
+            int(col(&row, "parent_oid")),
+        );
+        if let (Some(&child_idx), Some(&parent_idx)) =
+            (node_index.get(&child_key), node_index.get(&parent_key))
+        {
+            if child_idx != parent_idx {
+                children_of[parent_idx].insert(child_idx);
+            }
+        }
+    }
+
+    // Propagate `depends_on_view` and `depends_on_table` from parents to children in O(V + E).
+    let mut queue = VecDeque::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.depends_on_view {
+            queue.push_back(idx);
+        }
+    }
+    while let Some(parent_idx) = queue.pop_front() {
+        for &child_idx in &children_of[parent_idx] {
+            if !nodes[child_idx].depends_on_view {
+                nodes[child_idx].depends_on_view = true;
+                queue.push_back(child_idx);
+            }
+        }
+    }
+
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.depends_on_table {
+            queue.push_back(idx);
+        }
+    }
+    while let Some(parent_idx) = queue.pop_front() {
+        for &child_idx in &children_of[parent_idx] {
+            if !nodes[child_idx].depends_on_table {
+                nodes[child_idx].depends_on_table = true;
+                queue.push_back(child_idx);
+            }
+        }
+    }
+
+    let stages: Vec<u8> = nodes
+        .iter()
+        .map(|n| {
+            if n.depends_on_view {
+                3
+            } else if n.depends_on_table {
+                2
+            } else {
+                1
+            }
+        })
+        .collect();
+
+    let topo_sort_stage = |target_stage: u8| -> Vec<String> {
+        let mut in_degree = vec![0usize; nodes.len()];
+        for (parent_idx, children) in children_of.iter().enumerate() {
+            if stages[parent_idx] != target_stage {
+                continue;
+            }
+            for &child_idx in children {
+                if stages[child_idx] == target_stage {
+                    in_degree[child_idx] += 1;
+                }
+            }
+        }
+        let key_for = |idx: usize| -> (u8, String, i64, usize) {
+            let n = &nodes[idx];
+            (u8::from(n.is_func), n.name.clone(), n.oid, idx)
+        };
+        let mut ready = BTreeSet::new();
+        let mut remaining = BTreeSet::new();
+        for (idx, &st) in stages.iter().enumerate() {
+            if st == target_stage {
+                if in_degree[idx] == 0 {
+                    ready.insert(key_for(idx));
+                } else {
+                    remaining.insert(key_for(idx));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        while let Some((_, _, _, idx)) = ready.pop_first() {
+            out.push(nodes[idx].stmt.clone());
+            for &child_idx in &children_of[idx] {
+                if stages[child_idx] == target_stage && in_degree[child_idx] > 0 {
+                    in_degree[child_idx] -= 1;
+                    if in_degree[child_idx] == 0 {
+                        let k = key_for(child_idx);
+                        remaining.remove(&k);
+                        ready.insert(k);
+                    }
+                }
+            }
+        }
+        for (_, _, _, idx) in remaining {
+            out.push(nodes[idx].stmt.clone());
+        }
+        out
+    };
+
+    (topo_sort_stage(1), topo_sort_stage(2), topo_sort_stage(3))
 }
 
 /// Logical SQL import into a fresh PostgreSQL 18 cluster (`scripts/migrate-17-to-18.ts`).
