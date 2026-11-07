@@ -149,6 +149,17 @@ fn main() {
         println!("restart ok");
         return;
     }
+    if mode == "corrupt-write" {
+        corrupt_write(db);
+        println!("corrupt-write ok");
+        return;
+    }
+    if mode == "corrupt-read" {
+        corrupt_read(&db);
+        db.close().expect("close corrupt-read");
+        println!("corrupt-read ok");
+        return;
+    }
     if durability_mode(&db, &mode) {
         return;
     }
@@ -164,7 +175,12 @@ fn main() {
         println!("abrupt ok");
         std::process::exit(0);
     }
-    for setting in ["fsync", "synchronous_commit", "full_page_writes"] {
+    for setting in [
+        "fsync",
+        "synchronous_commit",
+        "full_page_writes",
+        "data_checksums",
+    ] {
         let row = db
             .first(&format!("SHOW {setting}"), &[])
             .expect("durability setting")
@@ -1006,6 +1022,72 @@ const MARKER_ROWS: i64 = 200;
 /// The marker rows only: commit-a/commit-b add rows of their own.
 const MARKER_COUNT: &str =
     "SELECT count(*)::int8 FROM markers WHERE v LIKE 'PGLITE-SMOKE-PLAINTEXT-MARKER-%'";
+
+/// Write and checkpoint a canary relation in `postgres` (`base/5/`), close the
+/// engine, then corrupt one 16-byte block in the relation's heap file on disk
+/// (#537). Under both plaintext and AES-XTS (`pglite-encfs` codecs 2/3), the
+/// last 32..16 bytes of the file lie inside the tuple payload at the end of
+/// block 0.
+fn corrupt_write(db: Connection) {
+    let row = db
+        .first("SHOW data_checksums", &[])
+        .expect("SHOW data_checksums")
+        .unwrap();
+    assert_eq!(text(&row[0].1), "on", "data_checksums must be on");
+    db.exec(
+        "DROP TABLE IF EXISTS checksum_canary; \
+         CREATE TABLE checksum_canary (id int primary key, payload text)",
+    )
+    .expect("create checksum_canary");
+    db.run(
+        "INSERT INTO checksum_canary VALUES (1, $1)",
+        &[Value::Text("intact-canary-before-corruption".into())],
+    )
+    .expect("insert checksum_canary");
+    db.exec("CHECKPOINT").expect("checkpoint checksum_canary");
+    let relpath = first_text(
+        &db,
+        "SELECT pg_relation_filepath('checksum_canary')::text AS p",
+        &[],
+    );
+    assert!(
+        relpath.starts_with("base/5/"),
+        "expected checksum_canary in base/5/, got {relpath}"
+    );
+    db.close().expect("close before corrupting relation file");
+
+    let path = format!("/data/pglite/data/{relpath}");
+    let mut bytes = std::fs::read(&path).expect("read relation file");
+    assert!(
+        bytes.len() >= 8192,
+        "relation file {path} too short: {}",
+        bytes.len()
+    );
+    let target = bytes.len() - 32;
+    for b in &mut bytes[target..target + 16] {
+        *b ^= 0xA5;
+    }
+    std::fs::write(&path, &bytes).expect("write corrupted relation file");
+}
+
+/// Reading the corrupted relation in a fresh engine instance (cold shared
+/// buffers) must fail with SQLSTATE `XX001` (`ERRCODE_DATA_CORRUPTED`,
+/// `invalid page in block 0`) instead of returning corrupted tuple data (#537).
+fn corrupt_read(db: &Connection) {
+    let result = db.first("SELECT payload FROM checksum_canary WHERE id = 1", &[]);
+    match &result {
+        Err(Error::ExecutionFailed(e))
+            if e.code == "XX001" && e.message.contains("invalid page in block 0") => {}
+        other => panic!("expected ExecutionFailed(XX001, invalid page in block 0), got {other:?}"),
+    }
+    // The session remains usable after the page-checksum failure.
+    assert_eq!(
+        first_text(db, "SELECT 'session usable after XX001'::text AS v", &[]),
+        "session usable after XX001"
+    );
+    db.exec("DROP TABLE checksum_canary")
+        .expect("drop corrupted checksum_canary");
+}
 
 /// Modes for storage layers below the engine (pglite-encfs `make smoke`).
 /// Returns true when `mode` was one of them.
