@@ -6,13 +6,30 @@ User-facing CLI commands live in `di-framework/cli-extensions` (`@di-framework/c
 
 First publish from this remote is **6.0.0**.
 
+## Documentation
+
+Full guides for operating and developing on the platform live in [`docs/`](docs/README.md):
+
+- [Platform (`docs/platform.md`)](docs/platform.md) — Application bindings, WASI 0.3 builds, Pulumi cluster installation, HTTP gateway, network isolation, and backups
+- [Backing Services (`docs/backing-services.md`)](docs/backing-services.md) — Tenant Redis, NATS, S3 blobstore, dedicated PostgreSQL, and egress requests
+- [Tenant Access & Registry (`docs/tenant-auth.md`)](docs/tenant-auth.md) — Per-tenant OAuth2 / API keys, gateway routes, OCI registry, `/v1` CLI workflow, and CA rotation
+- [Embedded PostgreSQL & Encryption at Rest (`docs/pglite.md`)](docs/pglite.md) — `@di-framework/pglite-component` and `@di-framework/pglite-encfs`
+- [Kubernetes with `di-framework-kube` (`docs/kube.md`)](docs/kube.md) — Local KubeSolo cluster lifecycle and live verification examples
+- [Platform Operator (`docs/platform-operator.md`)](docs/platform-operator.md), [`PlatformInstance` Reference (`docs/platform-instance-reference.md`)](docs/platform-instance-reference.md), and [Operate Platform Instances (`docs/platform-operator-operations.md`)](docs/platform-operator-operations.md)
+
 ## Packages
 
 | Path | Package | Use it for |
 | --- | --- | --- |
 | [`platform/platform`](platform/platform/README.md) | `@di-framework/platform` | Cluster install: Pulumi, CRDs, controller, tenancy, backing services |
 | [`platform/bindings`](platform/bindings/README.md) | `@di-framework/bindings` | Application guest bindings and workload metadata |
+| [`platform/pglite-component`](platform/pglite-component/README.md) | `@di-framework/pglite-component` | Embedded Wasm PostgreSQL provider (`di-framework:pglite/database@0.2.0`) |
+| [`platform/pglite-encfs`](platform/pglite-encfs/README.md) | `@di-framework/pglite-encfs` | Encrypted WASI filesystem layer for PGlite |
 | [`platform/sqlite-component`](platform/sqlite-component/README.md) | `@di-framework/sqlite-component` | `di-framework:sqlite@0.1.0` provider component |
+| [`platform/tenant-auth`](platform/tenant-auth/README.md) | `@di-framework/tenant-auth` | Per-tenant identity server, OAuth2/API keys, and `/v1` controller auth |
+| [`platform/tenant-cli`](platform/tenant-cli/README.md) | `@di-framework/tenant-cli` | `di-tenant` CLI for tenant login, deploys, services, and registry |
+| [`platform/oci-registry`](platform/oci-registry/README.md) | `@di-framework/oci-registry` | Per-tenant OCI v2 distribution registry |
+| [`platform/operator`](platform/operator/README.md) | `@di-framework/platform-operator` | `PlatformInstance` Kubernetes operator and Headlamp plugin |
 | [`platform/backup-agent`](platform/backup-agent/README.md) | `@di-framework/backup-agent` | Job image that dumps and restores backing services |
 | [`platform/backup-destination`](platform/backup-destination/README.md) | `@di-framework/backup-destination` | Tenant-namespace Helm operator and HTML console |
 | [`adapters/cloudflare`](adapters/cloudflare/README.md) | `@di-framework/cloudflare` | Cloudflare Workers binding discovery and injection |
