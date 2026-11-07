@@ -9,6 +9,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+mod checksums;
 mod engine;
 mod pgwire;
 

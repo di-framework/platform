@@ -269,7 +269,7 @@ fn install_asset(runtime: &Path, name: &str, bytes: &[u8]) -> Result<(), String>
 /// Atomic install: write to a temp file in the same directory, fsync it,
 /// then rename over the destination and fsync the directory, so a crash
 /// never leaves a truncated file that later boots would mistake for valid.
-fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
     // `parent()` is `None` only for a bare prefix (`""`/`/`); callers always
     // pass a file below a directory. Never panic here: `panic=abort` would
     // trap the whole engine.
@@ -422,6 +422,13 @@ fn ensure_durability(data: &Path) -> Result<(), String> {
 /// `template1`) never flip.
 fn initialize_cluster(root: &Path, runtime: &Path, data: &Path) -> Result<(), String> {
     start_engine(&BOOTSTRAP_ENGINE, runtime, data, LEGACY_DATABASE)?;
+    // `pgl_initdb` runs `BootstrapModeMain` without `-k`, writing `global/` and
+    // `base/1/` with `data_checksum_version = 0` before shutting down. Stamp
+    // those BKI pages and enable `data_checksum_version = 1` in `pg_control`
+    // now so `RePostgresSingleUserMain` (`BOOTSTRAP_ENGINE.backend`) reads
+    // `pg_control` with checksums enabled and stamps every page it writes
+    // while populating `template1`, `template0`, and `postgres`.
+    crate::checksums::enable_cluster_checksums(data)?;
     // Runs initdb's post-bootstrap SQL, which creates `template0` and
     // `postgres` from a `template1` session. This instance is not used again.
     (BOOTSTRAP_ENGINE.backend)();
