@@ -269,7 +269,7 @@ fn install_asset(runtime: &Path, name: &str, bytes: &[u8]) -> Result<(), String>
 /// Atomic install: write to a temp file in the same directory, fsync it,
 /// then rename over the destination and fsync the directory, so a crash
 /// never leaves a truncated file that later boots would mistake for valid.
-fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
     // `parent()` is `None` only for a bare prefix (`""`/`/`); callers always
     // pass a file below a directory. Never panic here: `panic=abort` would
     // trap the whole engine.

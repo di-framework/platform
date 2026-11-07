@@ -6,7 +6,8 @@
 //! raising SQLSTATE `XX001` on corruption) and stamps `pd_checksum` on every page write
 //! (`PageSetChecksumCopy` / `PageSetChecksumInplace`).
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 /// PostgreSQL page size (`BLCKSZ`).
@@ -269,7 +270,18 @@ pub fn stamp_relation_file(path: &Path, segmentno: u32) -> Result<usize, String>
         }
     }
     if rewritten > 0 {
-        fs::write(path, &buf).map_err(|e| format!("write {}: {e}", path.display()))?;
+        // Overwrite in place without `O_TRUNC` (`fs::write`) or `rename` (`write_atomic`):
+        // 1. Avoiding `O_TRUNC` ensures the relation file is never truncated to 0 bytes.
+        // 2. Avoiding `rename` preserves the inode that `BOOTSTRAP_ENGINE`'s `VfdCache`
+        //    already holds open between `pgl_initdb()` and `pgl_backend()` (`RePostgresSingleUserMain`).
+        // Crash atomicity is governed by `global/pg_control`, which is updated last via
+        // `write_atomic` after all relation pages carry valid checksums.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        file.write_all(&buf)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(rewritten)
 }
@@ -319,8 +331,7 @@ pub fn enable_cluster_checksums(data: &Path) -> Result<usize, String> {
     let mut control =
         fs::read(&control_path).map_err(|e| format!("read {}: {e}", control_path.display()))?;
     if set_control_checksum_version(&mut control, PG_DATA_CHECKSUM_VERSION)? {
-        fs::write(&control_path, &control)
-            .map_err(|e| format!("write {}: {e}", control_path.display()))?;
+        crate::engine::write_atomic(&control_path, &control, false)?;
     }
     Ok(rewritten)
 }

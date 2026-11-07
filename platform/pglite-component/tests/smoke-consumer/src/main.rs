@@ -157,7 +157,7 @@ fn main() {
     if mode == "corrupt-read" {
         corrupt_read(&db);
         db.close().expect("close corrupt-read");
-        println!("corrupt-read ok");
+        println!("\ncorrupt-read ok");
         return;
     }
     if durability_mode(&db, &mode) {
@@ -1087,6 +1087,8 @@ fn corrupt_read(db: &Connection) {
     );
     db.exec("DROP TABLE checksum_canary")
         .expect("drop corrupted checksum_canary");
+    db.exec("CHECKPOINT")
+        .expect("checkpoint after dropping checksum_canary");
 }
 
 /// Modes for storage layers below the engine (pglite-encfs `make smoke`).

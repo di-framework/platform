@@ -16,6 +16,8 @@ const MARKERS = {
   write: 'smoke ok',
   read: 'restart ok',
   abrupt: 'abrupt ok',
+  'corrupt-write': 'corrupt-write ok',
+  'corrupt-read': 'corrupt-read ok',
   'upgrade-write': 'upgrade write ok',
   'upgrade-read': 'upgrade read ok',
   database: 'database ok',
@@ -295,6 +297,8 @@ export async function smoke(ctx: Context): Promise<void> {
     });
     await runMode(ctx, composed, smokeDir, 'abrupt', mount);
     await runMode(ctx, composed, smokeDir, 'read', mount);
+    await runMode(ctx, composed, smokeDir, 'corrupt-write', mount);
+    await runMode(ctx, composed, smokeDir, 'corrupt-read', mount);
     await expectMarker(dataDir, 'postgres\n', 'new directory after restarts');
   } finally {
     await rm(dataDir, { recursive: true, force: true });

@@ -842,6 +842,8 @@ export async function smoke(ctx: Context): Promise<void> {
     await h.run(enc, data, 'read', A, 'restart ok');
     await h.run(enc, data, 'marker-write', A, 'marker-write ok');
     await h.run(enc, data, 'marker-read', A, 'marker-read ok');
+    await h.run(enc, data, 'corrupt-write', A, 'corrupt-write ok');
+    await h.run(enc, data, 'corrupt-read', A, 'corrupt-read ok');
 
     // Only ciphertext on disk.
     const raw = [rawA, rawB, ...secrets.map((s) => Buffer.from(s))];
