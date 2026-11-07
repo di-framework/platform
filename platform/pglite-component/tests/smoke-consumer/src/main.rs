@@ -688,12 +688,18 @@ fn upgrade_write(db: &Connection) {
     )
     .expect("insert upgrade_check");
     db.exec(
+        "CREATE FUNCTION upgrade_norm(val text) RETURNS text \
+         LANGUAGE sql IMMUTABLE \
+         BEGIN ATOMIC SELECT upper(val); END",
+    )
+    .expect("create upgrade_norm BEGIN ATOMIC function");
+    db.exec(
         "CREATE TABLE upgrade_items ( \
            id serial PRIMARY KEY, \
            check_id int NOT NULL REFERENCES upgrade_check(id), \
            seq_num int GENERATED ALWAYS AS IDENTITY, \
            label text NOT NULL, \
-           upper_label text GENERATED ALWAYS AS (upper(label)) STORED \
+           upper_label text GENERATED ALWAYS AS (upgrade_norm(label)) STORED \
          )",
     )
     .expect("create upgrade_items");
@@ -727,6 +733,12 @@ fn upgrade_write(db: &Connection) {
          SELECT id, label, upper_label FROM upgrade_summary",
     )
     .expect("create dependent view a_dependent_summary");
+    db.exec(
+        "CREATE FUNCTION upgrade_dep_summary_rows() RETURNS SETOF a_dependent_summary \
+         LANGUAGE sql STABLE \
+         BEGIN ATOMIC SELECT id, label, upper_label FROM a_dependent_summary ORDER BY label; END",
+    )
+    .expect("create upgrade_dep_summary_rows");
     db.exec("CHECKPOINT").expect("checkpoint upgrade_write");
 }
 
@@ -908,39 +920,108 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    // Early function pass: export string-bodied user functions whose parameter and
-    // return types do not reference any `public` relation composite/array type so
-    // table column DEFAULTs, CHECK constraints, and generated columns can call them.
+    const FUNC_STAGE_CTE: &str = "\
+        WITH RECURSIVE public_funcs AS ( \
+          SELECT p.oid, p.proname, pg_get_functiondef(p.oid) || ';' AS stmt \
+          FROM pg_proc p \
+          JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' \
+            AND p.prokind = 'f' \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+            ) \
+        ), \
+        public_rels AS ( \
+          SELECT c.oid, c.relname, c.relkind, c.reltype \
+          FROM pg_class c \
+          JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' \
+            AND c.relkind IN ('r', 'p', 'f', 'v') \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+            ) \
+        ), \
+        func_call_edges AS ( \
+          SELECT DISTINCT f.oid AS child_oid, ref.oid AS parent_oid \
+          FROM public_funcs f \
+          JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = f.oid \
+            AND d.refclassid = 'pg_proc'::regclass \
+          JOIN public_funcs ref ON ref.oid = d.refobjid \
+          WHERE ref.oid <> f.oid \
+        ), \
+        func_reach AS ( \
+          SELECT oid AS root_oid, oid AS reach_oid, ARRAY[oid] AS path \
+          FROM public_funcs \
+          UNION ALL \
+          SELECT r.root_oid, e.parent_oid, r.path || e.parent_oid \
+          FROM func_reach r \
+          JOIN func_call_edges e ON e.child_oid = r.reach_oid \
+          WHERE NOT (e.parent_oid = ANY(r.path)) \
+        ), \
+        func_direct_rels AS ( \
+          SELECT DISTINCT f.oid AS func_oid, rc.oid AS rel_oid, rc.relkind \
+          FROM public_funcs f \
+          JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = f.oid \
+          LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+          JOIN public_rels rc ON ( \
+            (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
+            OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
+          ) \
+        ), \
+        func_stage AS ( \
+          SELECT f.oid, f.proname, f.stmt, \
+            CASE \
+              WHEN EXISTS ( \
+                SELECT 1 FROM func_reach r \
+                JOIN func_direct_rels dr ON dr.func_oid = r.reach_oid \
+                WHERE r.root_oid = f.oid AND dr.relkind = 'v' \
+              ) THEN 3 \
+              WHEN EXISTS ( \
+                SELECT 1 FROM func_reach r \
+                JOIN func_direct_rels dr ON dr.func_oid = r.reach_oid \
+                WHERE r.root_oid = f.oid AND dr.relkind IN ('r', 'p', 'f') \
+              ) THEN 2 \
+              ELSE 1 \
+            END AS stage \
+          FROM public_funcs f \
+        )";
+
+    let func_stage_query = format!(
+        "{FUNC_STAGE_CTE}, \
+         stage_funcs AS ( \
+           SELECT oid, proname, stmt FROM func_stage WHERE stage = $1::int8 \
+         ), \
+         stage_edges AS ( \
+           SELECT e.child_oid, e.parent_oid \
+           FROM func_call_edges e \
+           JOIN stage_funcs c ON c.oid = e.child_oid \
+           JOIN stage_funcs p ON p.oid = e.parent_oid \
+         ), \
+         stage_depths AS ( \
+           SELECT f.oid, 0 AS depth, ARRAY[f.oid] AS path \
+           FROM stage_funcs f \
+           WHERE NOT EXISTS (SELECT 1 FROM stage_edges e WHERE e.child_oid = f.oid) \
+           UNION ALL \
+           SELECT c.oid, p.depth + 1, p.path || c.oid \
+           FROM stage_depths p \
+           JOIN stage_edges e ON e.parent_oid = p.oid \
+           JOIN stage_funcs c ON c.oid = e.child_oid \
+           WHERE NOT (c.oid = ANY(p.path)) \
+         ) \
+         SELECT f.stmt AS stmt \
+         FROM stage_funcs f \
+         LEFT JOIN ( \
+           SELECT oid, max(depth) AS depth FROM stage_depths GROUP BY oid \
+         ) d ON d.oid = f.oid \
+         ORDER BY COALESCE(d.depth, 0), f.proname, f.oid"
+    );
+
+    // Function pass 1 (before tables): relation-free user functions (including
+    // relation-free `BEGIN ATOMIC` functions) so column DEFAULTs, CHECK constraints,
+    // and generated columns can reference them.
     let early_funcs = db
-        .query(
-            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
-             FROM pg_proc p \
-             JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'public' \
-               AND p.prokind = 'f' \
-               AND p.prosqlbody IS NULL \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
-               ) \
-               AND NOT EXISTS ( \
-                 SELECT 1 \
-                 FROM pg_type t \
-                 JOIN pg_class rc ON rc.oid = t.typrelid \
-                 JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
-                 WHERE rn.nspname = 'public' \
-                   AND ( \
-                     t.oid = p.prorettype \
-                     OR t.typarray = p.prorettype \
-                     OR t.oid = ANY(p.proargtypes::oid[]) \
-                     OR t.typarray = ANY(p.proargtypes::oid[]) \
-                     OR t.oid = ANY(COALESCE(p.proallargtypes, '{}')) \
-                     OR t.typarray = ANY(COALESCE(p.proallargtypes, '{}')) \
-                   ) \
-               ) \
-             ORDER BY p.proname, p.oid",
-            &[],
-        )
-        .expect("query early functions");
+        .query(&func_stage_query, &[Value::Integer(1)])
+        .expect("query stage 1 functions");
     for row in early_funcs {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
@@ -1078,46 +1159,16 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    // Late function pass: export SQL-standard (`BEGIN ATOMIC`) functions and functions
-    // whose parameter or return types reference `public` relation composite/array types,
-    // after tables exist and before standalone indexes and views.
-    let late_funcs = db
-        .query(
-            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
-             FROM pg_proc p \
-             JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'public' \
-               AND p.prokind = 'f' \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
-               ) \
-               AND ( \
-                 p.prosqlbody IS NOT NULL \
-                 OR EXISTS ( \
-                   SELECT 1 \
-                   FROM pg_type t \
-                   JOIN pg_class rc ON rc.oid = t.typrelid \
-                   JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
-                   WHERE rn.nspname = 'public' \
-                     AND ( \
-                       t.oid = p.prorettype \
-                       OR t.typarray = p.prorettype \
-                       OR t.oid = ANY(p.proargtypes::oid[]) \
-                       OR t.typarray = ANY(p.proargtypes::oid[]) \
-                       OR t.oid = ANY(COALESCE(p.proallargtypes, '{}')) \
-                       OR t.typarray = ANY(COALESCE(p.proallargtypes, '{}')) \
-                     ) \
-                 ) \
-               ) \
-             ORDER BY p.proname, p.oid",
-            &[],
-        )
-        .expect("query late functions");
-    for row in late_funcs {
+    // Function pass 2 (after tables & FKs, before standalone indexes and views):
+    // functions that depend on `public` tables (`relkind IN ('r', 'p', 'f')`) but
+    // not on any `public` view (`relkind = 'v'`).
+    let table_funcs = db
+        .query(&func_stage_query, &[Value::Integer(2)])
+        .expect("query stage 2 functions");
+    for row in table_funcs {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
     }
-    out.push_str("SET check_function_bodies = true;\n");
 
     // Standalone indexes not backing a constraint.
     let idxs = db
@@ -1145,52 +1196,77 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    // Order views topologically by view-on-view dependency depth over pg_rewrite/pg_depend.
-    let views = db
-        .query(
-            "WITH RECURSIVE public_views AS ( \
-               SELECT c.oid, c.relname \
-               FROM pg_class c \
-               JOIN pg_namespace n ON n.oid = c.relnamespace \
-               WHERE n.nspname = 'public' \
-                 AND c.relkind = 'v' \
-                 AND NOT EXISTS ( \
-                   SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
-                 ) \
-             ), \
-             view_edges AS ( \
-               SELECT DISTINCT v.oid AS child_oid, ref.oid AS parent_oid \
-               FROM public_views v \
-               JOIN pg_rewrite r ON r.ev_class = v.oid \
-               JOIN pg_depend d ON d.objid = r.oid \
-               JOIN public_views ref ON ref.oid = d.refobjid \
-               WHERE ref.oid <> v.oid \
-             ), \
-             view_depths AS ( \
-               SELECT v.oid, v.relname, 0 AS depth, ARRAY[v.oid] AS path \
-               FROM public_views v \
-               WHERE NOT EXISTS (SELECT 1 FROM view_edges e WHERE e.child_oid = v.oid) \
-               UNION ALL \
-               SELECT c.oid, c.relname, p.depth + 1, p.path || c.oid \
-               FROM view_depths p \
-               JOIN view_edges e ON e.parent_oid = p.oid \
-               JOIN public_views c ON c.oid = e.child_oid \
-               WHERE NOT (c.oid = ANY(p.path)) \
-             ) \
-             SELECT format('CREATE OR REPLACE VIEW public.%I AS %s;', \
-                           v.relname, pg_get_viewdef(v.oid, true)) AS stmt \
-             FROM public_views v \
-             LEFT JOIN ( \
-               SELECT oid, max(depth) AS depth FROM view_depths GROUP BY oid \
-             ) d ON d.oid = v.oid \
-             ORDER BY COALESCE(d.depth, 0), v.relname, v.oid",
-            &[],
-        )
-        .expect("query views");
-    for row in views {
+    // Pass 3: emit `public` views and view-dependent functions in unified topological
+    // dependency order over `pg_rewrite` and `pg_depend`, then restore `check_function_bodies`.
+    let stage3_query = format!(
+        "{FUNC_STAGE_CTE}, \
+         stage3_nodes AS ( \
+           SELECT 'v:' || r.oid::text AS node_id, 0 AS kind_order, r.relname AS name, r.oid AS oid, \
+                  format('CREATE OR REPLACE VIEW public.%I AS %s;', \
+                         r.relname, pg_get_viewdef(r.oid, true)) AS stmt \
+           FROM public_rels r \
+           WHERE r.relkind = 'v' \
+           UNION ALL \
+           SELECT 'f:' || f.oid::text AS node_id, 1 AS kind_order, f.proname AS name, f.oid AS oid, \
+                  f.stmt AS stmt \
+           FROM func_stage f \
+           WHERE f.stage = 3 \
+         ), \
+         stage3_edges AS ( \
+           SELECT DISTINCT 'v:' || v.oid::text AS child_id, \
+             CASE \
+               WHEN d.refclassid = 'pg_proc'::regclass THEN 'f:' || pf.oid::text \
+               ELSE 'v:' || pv.oid::text \
+             END AS parent_id \
+           FROM public_rels v \
+           JOIN pg_rewrite rw ON rw.ev_class = v.oid \
+           JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
+           LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+           LEFT JOIN public_rels pv ON pv.relkind = 'v' AND pv.oid <> v.oid AND ( \
+             (d.refclassid = 'pg_class'::regclass AND pv.oid = d.refobjid) \
+             OR (d.refclassid = 'pg_type'::regclass AND (pv.oid = t.typrelid OR pv.reltype = t.typelem)) \
+           ) \
+           LEFT JOIN func_stage pf ON pf.stage = 3 \
+             AND d.refclassid = 'pg_proc'::regclass AND pf.oid = d.refobjid \
+           WHERE v.relkind = 'v' AND (pv.oid IS NOT NULL OR pf.oid IS NOT NULL) \
+           UNION \
+           SELECT DISTINCT 'f:' || f.oid::text AS child_id, 'v:' || dr.rel_oid::text AS parent_id \
+           FROM func_stage f \
+           JOIN func_direct_rels dr ON dr.func_oid = f.oid AND dr.relkind = 'v' \
+           WHERE f.stage = 3 \
+           UNION \
+           SELECT DISTINCT 'f:' || f.oid::text AS child_id, 'f:' || pf.oid::text AS parent_id \
+           FROM func_stage f \
+           JOIN func_call_edges e ON e.child_oid = f.oid \
+           JOIN func_stage pf ON pf.oid = e.parent_oid AND pf.stage = 3 \
+           WHERE f.stage = 3 \
+         ), \
+         stage3_depths AS ( \
+           SELECT n.node_id, 0 AS depth, ARRAY[n.node_id] AS path \
+           FROM stage3_nodes n \
+           WHERE NOT EXISTS (SELECT 1 FROM stage3_edges e WHERE e.child_id = n.node_id) \
+           UNION ALL \
+           SELECT c.node_id, p.depth + 1, p.path || c.node_id \
+           FROM stage3_depths p \
+           JOIN stage3_edges e ON e.parent_id = p.node_id \
+           JOIN stage3_nodes c ON c.node_id = e.child_id \
+           WHERE NOT (c.node_id = ANY(p.path)) \
+         ) \
+         SELECT n.stmt AS stmt \
+         FROM stage3_nodes n \
+         LEFT JOIN ( \
+           SELECT node_id, max(depth) AS depth FROM stage3_depths GROUP BY node_id \
+         ) d ON d.node_id = n.node_id \
+         ORDER BY COALESCE(d.depth, 0), n.kind_order, n.name, n.oid"
+    );
+    let views_and_funcs = db
+        .query(&stage3_query, &[])
+        .expect("query stage 3 views and functions");
+    for row in views_and_funcs {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
     }
+    out.push_str("SET check_function_bodies = true;\n");
 
     db.close().expect("close export-sql");
     std::fs::write(&dump_path, out).expect("write exported SQL dump");
@@ -1308,6 +1384,14 @@ fn upgrade_read(db: &Connection) {
     assert_eq!(
         first_text(db, "SELECT upper_label FROM upgrade_item_by_id(1)", &[]),
         "ITEM-ONE"
+    );
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT string_agg(upper_label, ',' ORDER BY label) AS labels FROM upgrade_dep_summary_rows()",
+            &[]
+        ),
+        "ITEM-ONE,ITEM-TWO"
     );
 
     // The extension migrated from 17.5 resolves its functions in 18.6.
