@@ -896,8 +896,16 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     const host = api.objects.get(hostPath)!;
     host.metadata.uid = 'host-uid-1';
     host.hostname = '10.0.0.1';
-    const pod = (name: string, ip: string, terminating = false) =>
-      api.seed({ ...hostPod(name, 'alpha', { terminating }), status: { podIP: ip } });
+    const pod = (
+      name: string,
+      ip: string,
+      options: { terminating?: boolean; phase?: string } | boolean = {},
+    ) => {
+      const opts = typeof options === 'boolean' ? { terminating: options } : options;
+      const seeded = hostPod(name, 'alpha', opts);
+      seeded.status = { ...(seeded.status as Record<string, unknown>), podIP: ip };
+      api.seed(seeded);
+    };
     pod('host-pod-1', '10.0.0.1');
     if (!hostReady)
       host.status = { conditions: [{ type: 'Ready', status: 'False', reason: 'NotReady' }] };
@@ -927,7 +935,7 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
       (api.objects.get(key(t))?.status as { conditions?: { reason: string }[] } | undefined)
         ?.conditions?.[0]?.reason;
     /** Fails calls that `match`, passing every other call through. */
-    const failing = (match: (method: string, path: string) => ApiError | undefined) => {
+    const failing = (match: (method: string, path: string) => unknown) => {
       const call = api.call.bind(api);
       return spyOn(api, 'call').mockImplementation(
         async (method: string, path: string, body?: unknown) => {
@@ -965,11 +973,13 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
   });
 
   it('re-nudges when another host joins the Ready set', async () => {
-    const { api, controller, t, patches, annotation } = setup();
+    const { api, controller, t, pod, patches, annotation } = setup();
     await controller.reconcileTenant(t);
     const second = structuredClone(api.objects.get(hostPath) as Resource);
     second.metadata = { ...second.metadata, name: 'alpha-host-2', uid: 'host-uid-2' };
+    second.hostname = '10.0.0.2';
     api.seed(second);
+    pod('host-pod-2', '10.0.0.2');
     await controller.reconcileTenant(t);
     expect(patches()).toHaveLength(2);
     expect(annotation('unplaced')).toBe('host-uid-1,host-uid-2');
@@ -986,6 +996,22 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
     next.hostname = '10.0.0.2';
     api.seed(next);
     pod('host-pod-2', '10.0.0.2');
+    await controller.reconcileTenant(t);
+    expect(annotation('unplaced')).toBe('host-uid-2');
+  });
+
+  it('leaves a Ready host out of the nudge when its pod has finished (#418)', async () => {
+    const { api, controller, t, pod, patches, annotation } = setup();
+    pod('host-pod-1', '10.0.0.1', { phase: 'Failed' });
+    await controller.reconcileTenant(t);
+    expect(patches()).toEqual([]);
+    // A Succeeded pod is finished too; only a live replacement pod's host is nudged.
+    pod('host-pod-1', '10.0.0.1', { phase: 'Succeeded' });
+    const next = structuredClone(api.objects.get(hostPath) as Resource);
+    next.metadata = { ...next.metadata, name: 'alpha-host-2', uid: 'host-uid-2' };
+    next.hostname = '10.0.0.2';
+    api.seed(next);
+    pod('host-pod-2', '10.0.0.2', { phase: 'Running' });
     await controller.reconcileTenant(t);
     expect(annotation('unplaced')).toBe('host-uid-2');
   });
@@ -1086,6 +1112,29 @@ describe('placement nudge after a tenant host becomes Ready (#418)', () => {
       expect(patches()).toEqual([]);
       expect(reason()).toBe('Reconciled');
       expect(warn.mock.calls[0]![0]).toContain('listing Workloads failed: boom');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs a failed Pod list in the nudge step without failing the reconcile or flipping readiness (#418)', async () => {
+    const { controller, t, patches, reason, failing } = setup();
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    let thrown: unknown = new ApiError(500, 'pods boom');
+    failing((method, path) =>
+      method === 'GET' &&
+      path.endsWith('/pods?labelSelector=wasmcloud.com%2Fhostgroup%3Dtenant-alpha')
+        ? thrown
+        : undefined,
+    );
+    try {
+      await controller.reconcileTenant(t);
+      expect(patches()).toEqual([]);
+      expect(reason()).toBe('Reconciled');
+      expect(warn.mock.calls[0]?.[0]).toContain('listing Pods failed: pods boom');
+      thrown = 'pods string boom';
+      await controller.reconcileTenant(t);
+      expect(warn.mock.calls[1]?.[0]).toContain('listing Pods failed: pods string boom');
     } finally {
       warn.mockRestore();
     }
