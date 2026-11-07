@@ -31,13 +31,13 @@ describe('parseBuildArgs', () => {
 });
 
 describe('engineBuildInfo', () => {
-  test('names PostgreSQL 17.11, its upstream commit, the WASI patch and the recipe', async () => {
+  test('names PostgreSQL 18.6, its upstream commit, the WASI patch and the recipe', async () => {
     const pins = await loadPins(resolve(import.meta.dir, '..'));
     expect(engineBuildInfo(pins, 'abc123')).toEqual([
-      'engine:          PostgreSQL 17.11, persistent WASI filesystem',
+      'engine:          PostgreSQL 18.6, persistent WASI filesystem',
       'extensions:      plpgsql, pgcrypto (OpenSSL 3.5.9 libcrypto)',
-      'engine-source:   https://github.com/postgres/postgres/tree/083ac033419f690758508e08c1736089384bbee8 (REL_17_11)',
-      'engine-patch:    engine/patches/postgresql-17.11-wasi.patch (sha256 abc123)',
+      'engine-source:   https://github.com/postgres/postgres/tree/724edf9bde9d356724ad384a2e196edc3c9f80f7 (REL_18_6)',
+      'engine-patch:    engine/patches/postgresql-18.6-wasi.patch (sha256 abc123)',
       `engine-recipe:   https://github.com/moznion/wasipg/tree/${pins.PGLITE_SOURCE_REF}`,
     ]);
   });
@@ -50,11 +50,11 @@ describe('engineBuildInfo', () => {
 });
 
 describe('third-party notices name the engine base', () => {
-  test('NOTICE names upstream 17.11 and the replayed Electric changes', async () => {
+  test('NOTICE names upstream 18.6 and the replayed Electric changes', async () => {
     const notice = await Bun.file(join(engineDir, 'NOTICE')).text();
-    expect(notice).toContain('PostgreSQL 17.11');
+    expect(notice).toContain('PostgreSQL 18.6');
     expect(notice).toContain('REL_17_5_WASM-pglite');
-    expect(notice).toContain('engine/patches/postgresql-17.11-wasi.patch');
+    expect(notice).toContain('engine/patches/postgresql-18.6-wasi.patch');
   });
 });
 

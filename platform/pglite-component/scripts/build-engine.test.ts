@@ -109,8 +109,8 @@ describe('patchUpstreamBuild', () => {
     expect(patched.buildSh.indexOf(PREPARED_CHECKOUT)).toBeLessThan(
       patched.buildSh.indexOf('bun "/pkg/scripts/patch-engine-source.ts" "$SRC"'),
     );
-    // The container build is told this is a 17.11 tree.
-    expect(patched.buildSh).toContain('-e PG_VERSION=17.11 -e PG_BRANCH=REL_17_5_WASM');
+    // The container build is told this is an 18.6 tree.
+    expect(patched.buildSh).toContain('-e PG_VERSION=18.6 -e PG_BRANCH=REL_17_5_WASM');
   });
 
   test('passes SOURCE_DATE_EPOCH into the build container', () => {
@@ -141,25 +141,25 @@ describe('patchUpstreamBuild', () => {
 });
 
 describe('engine source pins', () => {
-  test('tool-versions.env pins upstream REL_17_11 by tag and full commit', async () => {
+  test('tool-versions.env pins upstream REL_18_6 by tag and full commit', async () => {
     const source = postgresSource(await loadPins(pkgDir));
     expect(source).toEqual({
       repo: 'https://github.com/postgres/postgres.git',
-      tag: 'REL_17_11',
-      commit: '083ac033419f690758508e08c1736089384bbee8',
+      tag: 'REL_18_6',
+      commit: '724edf9bde9d356724ad384a2e196edc3c9f80f7',
     });
   });
 
   test('rejects a branch name or an abbreviated commit', () => {
     const pins = {
       POSTGRES_SOURCE_REPO: 'https://example.invalid/pg.git',
-      POSTGRES_SOURCE_TAG: 'REL_17_11',
-      POSTGRES_SOURCE_COMMIT: '083ac033419f690758508e08c1736089384bbee8',
+      POSTGRES_SOURCE_TAG: 'REL_18_6',
+      POSTGRES_SOURCE_COMMIT: '724edf9bde9d356724ad384a2e196edc3c9f80f7',
     };
-    expect(() => postgresSource({ ...pins, POSTGRES_SOURCE_TAG: 'REL_17_STABLE' })).toThrow(
+    expect(() => postgresSource({ ...pins, POSTGRES_SOURCE_TAG: 'REL_18_STABLE' })).toThrow(
       'must be a release tag',
     );
-    expect(() => postgresSource({ ...pins, POSTGRES_SOURCE_COMMIT: '083ac03' })).toThrow(
+    expect(() => postgresSource({ ...pins, POSTGRES_SOURCE_COMMIT: '724edf9' })).toThrow(
       'must be a full commit SHA',
     );
     expect(() => postgresSource({})).toThrow('missing pin POSTGRES_SOURCE_REPO');
@@ -172,13 +172,13 @@ describe('engine source pins', () => {
   test('the replay patch is text only and names its base and source', async () => {
     const patch = await Bun.file(join(pkgDir, ENGINE_SOURCE_PATCH)).text();
     const header = patch.slice(0, patch.indexOf('diff --git '));
-    expect(header).toContain('tag REL_17_11');
-    expect(header).toContain('commit 083ac033419f690758508e08c1736089384bbee8');
+    expect(header).toContain('tag REL_18_6');
+    expect(header).toContain('commit 724edf9bde9d356724ad384a2e196edc3c9f80f7');
     expect(header).toContain('REL_17_5_WASM-pglite (2194acf356e9b7bf7cff29c4ed4bd6b82b93895d)');
     expect(header).toContain('PostgreSQL License');
     expect(patch).not.toContain('GIT binary patch');
     expect(patch).not.toContain('Binary files ');
-    expect(patch.match(/^diff --git /gm)).toHaveLength(118);
+    expect(patch.match(/^diff --git /gm)).toHaveLength(119);
   });
 });
 

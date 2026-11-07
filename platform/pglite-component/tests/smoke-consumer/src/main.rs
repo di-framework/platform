@@ -34,8 +34,7 @@ fn col<'a>(row: &'a [(String, Value)], name: &str) -> &'a Value {
 fn main() {
     // --- server version: proves the handshake (startup + auth + ReadyForQuery) ---
     // The cross-version step runs `upgrade-write` against the previous release.
-    let expected =
-        std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "17.11".into());
+    let expected = std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "18.6".into());
     let version = server_version().expect("server-version");
     assert!(
         version.contains(&expected),
@@ -99,6 +98,21 @@ fn main() {
         println!("missing database ok");
         return;
     }
+    if mode == "upgrade-refused" {
+        upgrade_refused_mode();
+        println!("upgrade refused ok");
+        return;
+    }
+    if mode == "export-sql" {
+        export_sql_mode();
+        println!("export sql ok");
+        return;
+    }
+    if mode == "import-sql" {
+        import_sql_mode();
+        println!("import sql ok");
+        return;
+    }
     let db: Connection = open("/data/pglite", None).expect("open");
     assert!(matches!(
         open("/data/pglite", None),
@@ -108,7 +122,7 @@ fn main() {
     // initialized (the very first session included), `template1` for one
     // written by an earlier release. The previous release reports template1.
     let expected_db = match mode.as_str() {
-        "upgrade-write" | "upgrade-read" => "template1",
+        "upgrade-write" => "template1",
         _ => "postgres",
     };
     assert_eq!(
@@ -657,7 +671,9 @@ const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785
 const UPGRADE_SECRET: &str = "written by the previous release";
 
 /// Run by the previous release (PostgreSQL 17.5) on a fresh data directory:
-/// a table, pgcrypto, and PGP ciphertext for the new engine to read back.
+/// tables (with serial, identity, generated columns, and a foreign key),
+/// a standalone index, a view, pgcrypto, PGP ciphertext, and a plpgsql function
+/// to migrate to 18.6.
 fn upgrade_write(db: &Connection) {
     db.exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         .expect("CREATE EXTENSION pgcrypto");
@@ -671,17 +687,729 @@ fn upgrade_write(db: &Connection) {
         ],
     )
     .expect("insert upgrade_check");
+    db.exec(
+        "CREATE FUNCTION upgrade_norm(val text) RETURNS text \
+         LANGUAGE sql IMMUTABLE \
+         BEGIN ATOMIC SELECT upper(val); END",
+    )
+    .expect("create upgrade_norm BEGIN ATOMIC function");
+    db.exec(
+        "CREATE TABLE upgrade_items ( \
+           id serial PRIMARY KEY, \
+           check_id int NOT NULL REFERENCES upgrade_check(id), \
+           seq_num int GENERATED ALWAYS AS IDENTITY, \
+           label text NOT NULL, \
+           upper_label text GENERATED ALWAYS AS (upgrade_norm(label)) STORED \
+         )",
+    )
+    .expect("create upgrade_items");
+    db.run(
+        "INSERT INTO upgrade_items (check_id, label) VALUES (1, $1)",
+        &[Value::Text("item-one".into())],
+    )
+    .expect("insert upgrade_items");
+    db.exec(
+        "CREATE FUNCTION upgrade_greeting(name text) RETURNS text \
+         LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN 'hello ' || name; END $$",
+    )
+    .expect("create upgrade_greeting");
+    db.exec(
+        "CREATE FUNCTION upgrade_item_by_id(target_id int) RETURNS SETOF upgrade_items \
+         LANGUAGE sql STABLE AS $$ SELECT * FROM upgrade_items WHERE id = target_id $$",
+    )
+    .expect("create upgrade_item_by_id");
+    db.exec(
+        "CREATE INDEX upgrade_items_label_idx ON upgrade_items (label, (upgrade_greeting(label)))",
+    )
+    .expect("create upgrade_items_label_idx");
+    db.exec(
+        "CREATE VIEW upgrade_summary AS \
+         SELECT c.id, c.payload, i.label, i.upper_label \
+         FROM upgrade_check c JOIN upgrade_items i ON i.check_id = c.id",
+    )
+    .expect("create upgrade_summary view");
+    db.exec(
+        "CREATE VIEW a_dependent_summary AS \
+         SELECT id, label, upper_label FROM upgrade_summary",
+    )
+    .expect("create dependent view a_dependent_summary");
+    db.exec(
+        "CREATE FUNCTION upgrade_dep_summary_rows() RETURNS SETOF a_dependent_summary \
+         LANGUAGE sql STABLE \
+         BEGIN ATOMIC SELECT id, label, upper_label FROM a_dependent_summary ORDER BY label; END",
+    )
+    .expect("create upgrade_dep_summary_rows");
+    db.exec("CHECKPOINT").expect("checkpoint upgrade_write");
 }
 
-/// Run by this release on the directory upgrade_write left: the engine is
-/// 17.11, the data is intact, and pgcrypto works on old and new data.
+/// Path 1 (#401): opening an unmigrated PostgreSQL 17 data directory under the
+/// PostgreSQL 18.6 provider fails cleanly with `Error::OpenFailed` naming the
+/// version mismatch and pointing to the documented migration guide and script.
+fn upgrade_refused_mode() {
+    match open("/data/pglite", None) {
+        Err(Error::OpenFailed(message)) => {
+            assert!(
+                message.contains(
+                    "incompatible PostgreSQL data directory: PG_VERSION is 17, \
+                     but this provider bundles PostgreSQL 18.6 and opens only \
+                     major version 18 data directories"
+                ),
+                "unexpected version mismatch message: {message}"
+            );
+            assert!(
+                message.contains(
+                    "platform/pglite-component/README.md#migrating-from-postgresql-17-to-18"
+                ),
+                "missing README migration anchor: {message}"
+            );
+            assert!(
+                message.contains("scripts/migrate-17-to-18.ts"),
+                "missing migration script pointer: {message}"
+            );
+        }
+        Err(other) => panic!("expected OpenFailed on PG 17 directory, got {other:?}"),
+        Ok(_) => panic!("opening an unmigrated PG 17 directory under PG 18.6 must fail"),
+    }
+}
+
+/// Logical SQL export for 17 -> 18 migration (`scripts/migrate-17-to-18.ts`).
+fn export_sql_mode() {
+    let dump_path =
+        std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
+    let requested_db = std::env::var("PGLITE_MIGRATE_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let assert_empty_public =
+        std::env::var("PGLITE_MIGRATE_ASSERT_EMPTY_PUBLIC").as_deref() == Ok("1");
+    let options = requested_db.as_deref().map(database);
+    let db = match open("/data/pglite", options.as_ref()) {
+        Ok(db) => db,
+        Err(Error::OpenFailed(msg))
+            if assert_empty_public && msg.contains("supports only the template1 database") =>
+        {
+            println!("sibling database public schema is empty");
+            return;
+        }
+        Err(err) => panic!("open source cluster for export: {err:?}"),
+    };
+
+    if assert_empty_public {
+        let active_db = current_database(&db);
+        let found = db
+            .first(
+                "SELECT string_agg(item, ', ' ORDER BY item) AS items FROM ( \
+                   SELECT c.relname AS item \
+                   FROM pg_class c \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE n.nspname = 'public' \
+                     AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+                     ) \
+                   UNION ALL \
+                   SELECT p.proname AS item \
+                   FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                   WHERE n.nspname = 'public' \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+                     ) \
+                 ) sub",
+                &[],
+            )
+            .expect("query non-default database public objects")
+            .expect("non-default database row");
+        if let Value::Text(items) = col(&found, "items") {
+            panic!(
+                "non-default database {active_db:?} contains user objects in public ({items}); \
+                 pass --database {active_db} to migrate it separately"
+            );
+        }
+        db.close().expect("close empty-check database");
+        println!("sibling database public schema is empty");
+        return;
+    }
+
+    // Fail closed if public contains object kinds this logical exporter does not support.
+    let unsupported = db
+        .first(
+            "SELECT string_agg(item, ', ' ORDER BY item) AS items FROM ( \
+               SELECT format('%s %I', \
+                        CASE c.relkind \
+                          WHEN 'm' THEN 'materialized view' \
+                          WHEN 'p' THEN 'partitioned table' \
+                          WHEN 'f' THEN 'foreign table' \
+                          ELSE 'relation' \
+                        END, \
+                        c.relname) AS item \
+               FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'public' \
+                 AND c.relkind IN ('m', 'p', 'f') \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+                 ) \
+               UNION ALL \
+               SELECT format('procedure %I', p.proname) AS item \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               WHERE n.nspname = 'public' \
+                 AND p.prokind = 'p' \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+                 ) \
+               UNION ALL \
+               SELECT format('trigger %I on %I', t.tgname, c.relname) AS item \
+               FROM pg_trigger t \
+               JOIN pg_class c ON c.oid = t.tgrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'public' \
+                 AND NOT t.tgisinternal \
+             ) sub",
+            &[],
+        )
+        .expect("query unsupported public objects")
+        .expect("unsupported public objects row");
+    if let Value::Text(items) = col(&unsupported, "items") {
+        panic!("unsupported public objects cannot be migrated automatically: {items}");
+    }
+
+    let mut out =
+        String::from("-- di-framework:pglite logical export\nSET check_function_bodies = false;\n");
+
+    let exts = db
+        .query(
+            "SELECT format('CREATE EXTENSION IF NOT EXISTS %I;', extname) AS stmt \
+             FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname",
+            &[],
+        )
+        .expect("query extensions");
+    for row in exts {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Export standalone and serial sequences before functions and tables (identity sequences
+    // have deptype = 'i' and are created by `GENERATED ... AS IDENTITY` on the table).
+    let seqs = db
+        .query(
+            "SELECT format( \
+               'CREATE SEQUENCE IF NOT EXISTS public.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s%s;', \
+               s.sequencename, \
+               s.data_type, \
+               s.increment_by, \
+               s.min_value, \
+               s.max_value, \
+               s.start_value, \
+               s.cache_size, \
+               CASE WHEN s.cycle THEN ' CYCLE' ELSE ' NO CYCLE' END \
+             ) AS stmt \
+             FROM pg_sequences s \
+             JOIN pg_class c ON c.relname = s.sequencename \
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname \
+             WHERE s.schemaname = 'public' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('e', 'i') \
+               ) \
+             ORDER BY s.sequencename",
+            &[],
+        )
+        .expect("query sequences");
+    for row in seqs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    let (stage1_funcs, stage2_funcs, stage3_views_and_funcs) = stage_functions_and_views(&db);
+
+    // Function pass 1 (before tables): relation-free user functions (including
+    // relation-free `BEGIN ATOMIC` functions) so column DEFAULTs, CHECK constraints,
+    // and generated columns can reference them.
+    for stmt in stage1_funcs {
+        out.push_str(&stmt);
+        out.push('\n');
+    }
+
+    let tables = db
+        .query(
+            "SELECT c.oid::int8 AS oid, c.relname AS relname, \
+                    EXISTS ( \
+                      SELECT 1 FROM pg_attribute a \
+                      WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity <> '' \
+                    ) AS has_identity, \
+                    format('CREATE TABLE public.%I (%s);', \
+                      c.relname, \
+                      concat_ws(', ', \
+                        (SELECT string_agg( \
+                           format('%I %s%s%s', \
+                             a.attname, \
+                             format_type(a.atttypid, a.atttypmod), \
+                             CASE \
+                               WHEN a.attidentity = 'a' THEN ' GENERATED ALWAYS AS IDENTITY' \
+                               WHEN a.attidentity = 'd' THEN ' GENERATED BY DEFAULT AS IDENTITY' \
+                               WHEN a.attgenerated = 's' THEN ' GENERATED ALWAYS AS (' || pg_get_expr(ad.adbin, ad.adrelid) || ') STORED' \
+                               WHEN ad.adbin IS NOT NULL THEN ' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid) \
+                               ELSE '' \
+                             END, \
+                             CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END \
+                           ), \
+                           ', ' ORDER BY a.attnum \
+                         ) \
+                         FROM pg_attribute a \
+                         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+                         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped), \
+                        (SELECT string_agg( \
+                           format('CONSTRAINT %I %s', con.conname, pg_get_constraintdef(con.oid)), \
+                           ', ' ORDER BY con.conname \
+                         ) \
+                         FROM pg_constraint con \
+                         WHERE con.conrelid = c.oid AND con.contype IN ('p', 'u', 'c')) \
+                      ) \
+                    ) AS ddl \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND c.relkind = 'r' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY c.relname",
+            &[],
+        )
+        .expect("query tables");
+    for table in tables {
+        let oid = int(col(&table, "oid"));
+        let relname = text(col(&table, "relname"));
+        let has_identity = matches!(col(&table, "has_identity"), Value::Boolean(true));
+        let ddl = text(col(&table, "ddl"));
+        out.push_str(&ddl);
+        out.push('\n');
+
+        let overriding = if has_identity {
+            " OVERRIDING SYSTEM VALUE"
+        } else {
+            ""
+        };
+        let row_query_row = db
+            .first(
+                "SELECT format( \
+                   'SELECT ''INSERT INTO public.%I (%s)' || $3::text || ' VALUES ('' || %s || '');'' AS stmt FROM public.%I', \
+                   $1::text, \
+                   string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum), \
+                   string_agg( \
+                     format( \
+                       'COALESCE(quote_literal(%I::text) || %L, ''NULL'')', \
+                       a.attname, \
+                       '::' || format_type(a.atttypid, a.atttypmod) \
+                     ), \
+                     ' || '', '' || ' ORDER BY a.attnum \
+                   ), \
+                   $1::text \
+                 ) AS row_query \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = $2::int8::oid \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                   AND a.attgenerated = ''",
+                &[
+                    Value::Text(relname),
+                    Value::Integer(oid),
+                    Value::Text(overriding.into()),
+                ],
+            )
+            .expect("build row export query")
+            .expect("row export query");
+        if let Value::Text(row_query) = col(&row_query_row, "row_query") {
+            for ins in db.query(row_query, &[]).expect("export table rows") {
+                out.push_str(&text(col(&ins, "stmt")));
+                out.push('\n');
+            }
+        }
+    }
+
+    // Advance all public sequences (both serial and identity) whose value was drawn.
+    let seq_vals = db
+        .query(
+            "SELECT format('SELECT pg_catalog.setval(%L, %s, true);', \
+                      format('public.%I', s.sequencename), \
+                      s.last_value) AS stmt \
+             FROM pg_sequences s \
+             WHERE s.schemaname = 'public' AND s.last_value IS NOT NULL \
+             ORDER BY s.sequencename",
+            &[],
+        )
+        .expect("query sequence values");
+    for row in seq_vals {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Foreign keys after all table data is loaded so table order cannot break references.
+    let fks = db
+        .query(
+            "SELECT format('ALTER TABLE public.%I ADD CONSTRAINT %I %s;', \
+                      c.relname, con.conname, pg_get_constraintdef(con.oid)) AS stmt \
+             FROM pg_constraint con \
+             JOIN pg_class c ON c.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND con.contype = 'f' \
+             ORDER BY c.relname, con.conname",
+            &[],
+        )
+        .expect("query foreign keys");
+    for row in fks {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Function pass 2 (after tables & FKs, before standalone indexes and views):
+    // functions that transitively depend on `public` tables (`relkind IN ('r', 'p', 'f')`)
+    // but not on any `public` view (`relkind = 'v'`).
+    for stmt in stage2_funcs {
+        out.push_str(&stmt);
+        out.push('\n');
+    }
+
+    // Standalone indexes not backing a constraint.
+    let idxs = db
+        .query(
+            "SELECT pg_get_indexdef(i.indexrelid) || ';' AS stmt \
+             FROM pg_index i \
+             JOIN pg_class idx ON idx.oid = i.indexrelid \
+             JOIN pg_class tbl ON tbl.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = tbl.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND tbl.relkind = 'r' \
+               AND i.indislive \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid \
+               ) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = idx.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY tbl.relname, idx.relname",
+            &[],
+        )
+        .expect("query standalone indexes");
+    for row in idxs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Pass 3: emit `public` views and view-dependent functions in unified topological
+    // dependency order, then restore `check_function_bodies`.
+    for stmt in stage3_views_and_funcs {
+        out.push_str(&stmt);
+        out.push('\n');
+    }
+    out.push_str("SET check_function_bodies = true;\n");
+
+    db.close().expect("close export-sql");
+    std::fs::write(&dump_path, out).expect("write exported SQL dump");
+}
+
+/// Classify `public` functions and views into 3 stages and topologically sort each
+/// stage in $O(V + E)$ using BFS reachability and Kahn's algorithm in Rust.
+fn stage_functions_and_views(db: &Connection) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    struct Node {
+        is_func: bool,
+        oid: i64,
+        name: String,
+        stmt: String,
+        depends_on_table: bool,
+        depends_on_view: bool,
+    }
+
+    let node_rows = db
+        .query(
+            "SELECT true AS is_func, \
+                    p.oid::int8 AS oid, \
+                    p.proname AS name, \
+                    pg_get_functiondef(p.oid) || ';' AS stmt, \
+                    EXISTS ( \
+                      SELECT 1 \
+                      FROM pg_depend d \
+                      LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+                      JOIN pg_class rc ON ( \
+                        (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
+                        OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
+                      ) \
+                      JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                      WHERE d.classid = 'pg_proc'::regclass \
+                        AND d.objid = p.oid \
+                        AND rn.nspname = 'public' \
+                        AND rc.relkind IN ('r', 'p', 'f') \
+                    ) AS depends_on_table, \
+                    EXISTS ( \
+                      SELECT 1 \
+                      FROM pg_depend d \
+                      LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+                      JOIN pg_class rc ON ( \
+                        (d.refclassid = 'pg_class'::regclass AND rc.oid = d.refobjid) \
+                        OR (d.refclassid = 'pg_type'::regclass AND (rc.oid = t.typrelid OR rc.reltype = t.typelem)) \
+                      ) \
+                      JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                      WHERE d.classid = 'pg_proc'::regclass \
+                        AND d.objid = p.oid \
+                        AND rn.nspname = 'public' \
+                        AND rc.relkind = 'v' \
+                    ) AS depends_on_view \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+             UNION ALL \
+             SELECT false AS is_func, \
+                    v.oid::int8 AS oid, \
+                    v.relname AS name, \
+                    format('CREATE OR REPLACE VIEW public.%I AS %s;', \
+                           v.relname, pg_get_viewdef(v.oid, true)) AS stmt, \
+                    false AS depends_on_table, \
+                    true AS depends_on_view \
+             FROM pg_class v \
+             JOIN pg_namespace n ON n.oid = v.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND v.relkind = 'v' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = v.oid AND d.deptype = 'e' \
+               )",
+            &[],
+        )
+        .expect("query public functions and views");
+
+    let mut nodes = Vec::with_capacity(node_rows.len());
+    let mut node_index = BTreeMap::new();
+    for row in node_rows {
+        let is_func = matches!(col(&row, "is_func"), Value::Boolean(true));
+        let oid = int(col(&row, "oid"));
+        let name = text(col(&row, "name"));
+        let stmt = text(col(&row, "stmt"));
+        let depends_on_table = matches!(col(&row, "depends_on_table"), Value::Boolean(true));
+        let depends_on_view = matches!(col(&row, "depends_on_view"), Value::Boolean(true));
+        let idx = nodes.len();
+        node_index.insert((is_func, oid), idx);
+        nodes.push(Node {
+            is_func,
+            oid,
+            name,
+            stmt,
+            depends_on_table,
+            depends_on_view,
+        });
+    }
+
+    let edge_rows = db
+        .query(
+            "SELECT DISTINCT true AS child_is_func, \
+                    p.oid::int8 AS child_oid, \
+                    true AS parent_is_func, \
+                    ref_p.oid::int8 AS parent_oid \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_depend d ON d.classid = 'pg_proc'::regclass \
+               AND d.objid = p.oid \
+               AND d.refclassid = 'pg_proc'::regclass \
+             JOIN pg_proc ref_p ON ref_p.oid = d.refobjid \
+             JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND ref_n.nspname = 'public' \
+               AND ref_p.prokind = 'f' \
+               AND ref_p.oid <> p.oid \
+             UNION \
+             SELECT DISTINCT true AS child_is_func, \
+                    p.oid::int8 AS child_oid, \
+                    false AS parent_is_func, \
+                    v.oid::int8 AS parent_oid \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid \
+             LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+             JOIN pg_class v ON ( \
+               (d.refclassid = 'pg_class'::regclass AND v.oid = d.refobjid) \
+               OR (d.refclassid = 'pg_type'::regclass AND (v.oid = t.typrelid OR v.reltype = t.typelem)) \
+             ) \
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND vn.nspname = 'public' \
+               AND v.relkind = 'v' \
+             UNION \
+             SELECT DISTINCT false AS child_is_func, \
+                    v.oid::int8 AS child_oid, \
+                    CASE WHEN d.refclassid = 'pg_proc'::regclass THEN true ELSE false END AS parent_is_func, \
+                    CASE WHEN d.refclassid = 'pg_proc'::regclass THEN ref_p.oid::int8 ELSE ref_v.oid::int8 END AS parent_oid \
+             FROM pg_class v \
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace \
+             JOIN pg_rewrite rw ON rw.ev_class = v.oid \
+             JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
+             LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid \
+             LEFT JOIN pg_class ref_v ON ref_v.relkind = 'v' AND ref_v.oid <> v.oid AND ( \
+               (d.refclassid = 'pg_class'::regclass AND ref_v.oid = d.refobjid) \
+               OR (d.refclassid = 'pg_type'::regclass AND (ref_v.oid = t.typrelid OR ref_v.reltype = t.typelem)) \
+             ) \
+             LEFT JOIN pg_namespace ref_vn ON ref_vn.oid = ref_v.relnamespace AND ref_vn.nspname = 'public' \
+             LEFT JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass \
+               AND ref_p.oid = d.refobjid \
+               AND ref_p.prokind = 'f' \
+             LEFT JOIN pg_namespace ref_pn ON ref_pn.oid = ref_p.pronamespace AND ref_pn.nspname = 'public' \
+             WHERE vn.nspname = 'public' \
+               AND v.relkind = 'v' \
+               AND (ref_vn.oid IS NOT NULL OR ref_pn.oid IS NOT NULL)",
+            &[],
+        )
+        .expect("query dependency edges");
+
+    // `children_of[parent]` holds all dependent child indices (`parent` must be created before `child`).
+    let mut children_of: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); nodes.len()];
+    for row in edge_rows {
+        let child_key = (
+            matches!(col(&row, "child_is_func"), Value::Boolean(true)),
+            int(col(&row, "child_oid")),
+        );
+        let parent_key = (
+            matches!(col(&row, "parent_is_func"), Value::Boolean(true)),
+            int(col(&row, "parent_oid")),
+        );
+        if let (Some(&child_idx), Some(&parent_idx)) =
+            (node_index.get(&child_key), node_index.get(&parent_key))
+        {
+            if child_idx != parent_idx {
+                children_of[parent_idx].insert(child_idx);
+            }
+        }
+    }
+
+    // Propagate `depends_on_view` and `depends_on_table` from parents to children in O(V + E).
+    let mut queue = VecDeque::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.depends_on_view {
+            queue.push_back(idx);
+        }
+    }
+    while let Some(parent_idx) = queue.pop_front() {
+        for &child_idx in &children_of[parent_idx] {
+            if !nodes[child_idx].depends_on_view {
+                nodes[child_idx].depends_on_view = true;
+                queue.push_back(child_idx);
+            }
+        }
+    }
+
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.depends_on_table {
+            queue.push_back(idx);
+        }
+    }
+    while let Some(parent_idx) = queue.pop_front() {
+        for &child_idx in &children_of[parent_idx] {
+            if !nodes[child_idx].depends_on_table {
+                nodes[child_idx].depends_on_table = true;
+                queue.push_back(child_idx);
+            }
+        }
+    }
+
+    let stages: Vec<u8> = nodes
+        .iter()
+        .map(|n| {
+            if n.depends_on_view {
+                3
+            } else if n.depends_on_table {
+                2
+            } else {
+                1
+            }
+        })
+        .collect();
+
+    let topo_sort_stage = |target_stage: u8| -> Vec<String> {
+        let mut in_degree = vec![0usize; nodes.len()];
+        for (parent_idx, children) in children_of.iter().enumerate() {
+            if stages[parent_idx] != target_stage {
+                continue;
+            }
+            for &child_idx in children {
+                if stages[child_idx] == target_stage {
+                    in_degree[child_idx] += 1;
+                }
+            }
+        }
+        let key_for = |idx: usize| -> (u8, String, i64, usize) {
+            let n = &nodes[idx];
+            (u8::from(n.is_func), n.name.clone(), n.oid, idx)
+        };
+        let mut ready = BTreeSet::new();
+        let mut remaining = BTreeSet::new();
+        for (idx, &st) in stages.iter().enumerate() {
+            if st == target_stage {
+                if in_degree[idx] == 0 {
+                    ready.insert(key_for(idx));
+                } else {
+                    remaining.insert(key_for(idx));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        while let Some((_, _, _, idx)) = ready.pop_first() {
+            out.push(nodes[idx].stmt.clone());
+            for &child_idx in &children_of[idx] {
+                if stages[child_idx] == target_stage && in_degree[child_idx] > 0 {
+                    in_degree[child_idx] -= 1;
+                    if in_degree[child_idx] == 0 {
+                        let k = key_for(child_idx);
+                        remaining.remove(&k);
+                        ready.insert(k);
+                    }
+                }
+            }
+        }
+        for (_, _, _, idx) in remaining {
+            out.push(nodes[idx].stmt.clone());
+        }
+        out
+    };
+
+    (topo_sort_stage(1), topo_sort_stage(2), topo_sort_stage(3))
+}
+
+/// Logical SQL import into a fresh PostgreSQL 18 cluster (`scripts/migrate-17-to-18.ts`).
+fn import_sql_mode() {
+    let dump_path =
+        std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
+    let requested_db = std::env::var("PGLITE_MIGRATE_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let options = requested_db.as_deref().map(database);
+    let sql = std::fs::read_to_string(&dump_path).expect("read exported SQL dump");
+    let db = open("/data/pglite", options.as_ref()).expect("open target cluster for import");
+    db.begin().expect("begin import transaction");
+    db.exec(&sql).expect("execute imported SQL dump");
+    db.commit().expect("commit import transaction");
+    db.exec("CHECKPOINT").expect("checkpoint imported cluster");
+    db.close().expect("close import-sql");
+}
+
+/// Run by this release on the directory migrated from `upgrade_write`: the
+/// engine is 18.6, checksums are enabled, the data and functions are intact,
+/// and pgcrypto works on old and new data.
 fn upgrade_read(db: &Connection) {
     let row = db
         .first("SHOW server_version", &[])
         .expect("server_version")
         .expect("server_version row");
     let engine = text(&row[0].1);
-    assert!(engine.starts_with("17.11"), "engine reports {engine:?}");
+    assert!(engine.starts_with("18.6"), "engine reports {engine:?}");
+    assert_eq!(
+        first_text(db, "SHOW data_checksums", &[]),
+        "on",
+        "migrated PG 18 cluster must have data_checksums on"
+    );
 
     let row = db
         .first(
@@ -692,8 +1420,87 @@ fn upgrade_read(db: &Connection) {
         .expect("upgrade_check row");
     assert_eq!(text(col(&row, "payload")), "kept across the upgrade");
     assert_eq!(text(col(&row, "secret")), UPGRADE_SECRET);
+    assert_eq!(
+        first_text(db, "SELECT upgrade_greeting('pg18') AS g", &[]),
+        "hello pg18"
+    );
 
-    // The extension created by 17.5 resolves its functions in 17.11.
+    // Verify migrated serial, identity, generated column, foreign key, index, and view.
+    let item = db
+        .first(
+            "SELECT id::int8 AS id, seq_num::int8 AS seq_num, label, upper_label \
+             FROM upgrade_items WHERE id = 1",
+            &[],
+        )
+        .expect("read upgrade_items")
+        .expect("upgrade_items row 1");
+    assert_eq!(int(col(&item, "id")), 1);
+    assert_eq!(int(col(&item, "seq_num")), 1);
+    assert_eq!(text(col(&item, "label")), "item-one");
+    assert_eq!(text(col(&item, "upper_label")), "ITEM-ONE");
+
+    // Inserting without id/seq_num uses the migrated serial + identity sequences (advancing to 2).
+    let item2 = db
+        .first(
+            "INSERT INTO upgrade_items (check_id, label) VALUES (1, 'item-two') \
+             RETURNING id::int8 AS id, seq_num::int8 AS seq_num, upper_label",
+            &[],
+        )
+        .expect("insert second upgrade_item")
+        .expect("second upgrade_item row");
+    assert_eq!(int(col(&item2, "id")), 2);
+    assert_eq!(int(col(&item2, "seq_num")), 2);
+    assert_eq!(text(col(&item2, "upper_label")), "ITEM-TWO");
+
+    // Foreign key constraint (contype = 'f') must be enforced after migration.
+    let fk_err = db.run(
+        "INSERT INTO upgrade_items (check_id, label) VALUES (999, 'bad-fk')",
+        &[],
+    );
+    assert!(
+        matches!(fk_err, Err(Error::ExecutionFailed(ref e)) if e.code == "23503"),
+        "expected foreign_key_violation (23503), got {fk_err:?}"
+    );
+
+    // Standalone index and view must be present after migration.
+    let idx = db
+        .first(
+            "SELECT to_regclass('public.upgrade_items_label_idx') IS NOT NULL AS present",
+            &[],
+        )
+        .expect("check migrated index")
+        .expect("index row");
+    assert!(matches!(col(&idx, "present"), Value::Boolean(true)));
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT upper_label FROM upgrade_summary WHERE label = 'item-one'",
+            &[]
+        ),
+        "ITEM-ONE"
+    );
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT upper_label FROM a_dependent_summary WHERE label = 'item-two'",
+            &[]
+        ),
+        "ITEM-TWO"
+    );
+    assert_eq!(
+        first_text(db, "SELECT upper_label FROM upgrade_item_by_id(1)", &[]),
+        "ITEM-ONE"
+    );
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT string_agg(upper_label, ',' ORDER BY label) AS labels FROM upgrade_dep_summary_rows()",
+            &[]
+        ),
+        "ITEM-ONE,ITEM-TWO"
+    );
+
+    // The extension migrated from 17.5 resolves its functions in 18.6.
     assert_eq!(
         first_text(db, "SELECT encode(digest('a', 'sha256'), 'hex') AS v", &[]),
         SHA256_A
@@ -706,7 +1513,7 @@ fn upgrade_read(db: &Connection) {
         ),
         "fresh"
     );
-    // Upstream's refusal (CVE-2026-14663) holds in the upgraded directory.
+    // Upstream's refusal (CVE-2026-14663) holds in the migrated directory.
     let refused = db.first("SELECT pgp_sym_encrypt('x', 'k', 'cipher-algo=bf')", &[]);
     assert!(
         matches!(&refused, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
@@ -714,7 +1521,7 @@ fn upgrade_read(db: &Connection) {
     );
     // And the directory stays writable.
     db.run(
-        "INSERT INTO upgrade_check VALUES (2, 'written by 17.11', NULL)",
+        "INSERT INTO upgrade_check VALUES (2, 'written by 18.6', NULL)",
         &[],
     )
     .expect("insert after upgrade");

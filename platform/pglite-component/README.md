@@ -1,6 +1,6 @@
 # di-framework:pglite — embedded PostgreSQL over WIT
 
-The provider bundles a PostgreSQL 17.11 engine, built for WASI, into a WebAssembly
+The provider bundles a PostgreSQL 18.6 engine, built for WASI, into a WebAssembly
 component. SQL calls cross WIT and WebAssembly memory. There is no TCP listener,
 network client, native sidecar, or separate database service.
 
@@ -61,10 +61,10 @@ runs the resulting `.wasm` directly. For a remote Podman daemon, set the task's
 
 ### Engine source
 
-The engine is upstream PostgreSQL `REL_17_11` with ElectricSQL's PGlite WASI
+The engine is upstream PostgreSQL `REL_18_6` with ElectricSQL's PGlite WASI
 changes replayed onto it. Electric maintains no WASI branch past 17.5 (its newer
 branches are Emscripten-only), so the 17.5 WASI changes are carried as
-[`engine/patches/postgresql-17.11-wasi.patch`](engine/patches/README.md)
+[`engine/patches/postgresql-18.6-wasi.patch`](engine/patches/README.md)
 (PostgreSQL License). `scripts/build-engine.ts` fetches the tag pinned in
 `scripts/tool-versions.env` (`POSTGRES_SOURCE_TAG`), refuses it unless it
 resolves to `POSTGRES_SOURCE_COMMIT`, and applies that patch and then the
@@ -116,13 +116,19 @@ and persistence across separate runtime processes. It also exits a runtime
 with an open transaction and verifies that committed rows survive and the
 uncommitted row is absent after restart. No scripted database server is used.
 
-`make smoke` also checks upgrades from the previous release. It downloads the
-published `@di-framework/pglite-component` tarball pinned as
+`make smoke` also checks the 17→18 major-version boundary and migration (#401).
+It downloads the published `@di-framework/pglite-component` tarball pinned as
 `PGLITE_UPGRADE_FROM_*` in `scripts/tool-versions.env` (6.0.15, PostgreSQL
-17.5) and checks its sha256. Its provider writes a data directory with a table,
-pgcrypto and PGP ciphertext. The new build must then open that directory,
-report 17.11, read the rows, decrypt the old ciphertext, run pgcrypto on new
-values, and write to it.
+17.5) and checks its sha256. Its provider writes a PostgreSQL 17 data directory
+with a table, pgcrypto, PGP ciphertext, and a `plpgsql` function. `make smoke`
+then verifies both paths:
+1. Opening the unmigrated 17 directory under this 18.6 build fails cleanly with
+   `open-failed` pointing to `#migrating-from-postgresql-17-to-18` and
+   `scripts/migrate-17-to-18.ts`.
+2. Running `scripts/migrate-17-to-18.ts` exports the 17 cluster and imports it
+   into a fresh PostgreSQL 18.6 directory, where the new build verifies
+   `18.6`, `data_checksums = on`, the migrated rows and function, PGP
+   decryption of the 17.5 ciphertext, pgcrypto on new values, and writability.
 
 ## Publishing to GHCR
 
@@ -501,34 +507,72 @@ annotations provide storage; they do not enforce database ownership.
 ## Upgrading across PostgreSQL major versions
 
 A data directory belongs to one PostgreSQL major version, recorded in
-`<root>/data/PG_VERSION`. Minor releases share the on-disk format: a directory
-written by the 17.5 engine (provider 6.0.15 and earlier) opens in place under
-17.11, and `make smoke` checks this.
+`<root>/data/PG_VERSION`. Minor releases within the same major series share the
+on-disk format; major releases (such as 17 → 18) do not.
 
-The engine opens only major version 17. For any other `PG_VERSION`, `open`
+The engine opens only major version 18. For any other `PG_VERSION`, `open`
 fails with `open-failed` and a message such as:
 
 ```text
-incompatible PostgreSQL data directory: PG_VERSION is 16, but this provider bundles
-PostgreSQL 17.11 and opens only major version 17 data directories; see
-platform/pglite-component/README.md#upgrading-across-postgresql-major-versions
+incompatible PostgreSQL data directory: PG_VERSION is 17, but this provider bundles
+PostgreSQL 18.6 and opens only major version 18 data directories; see
+platform/pglite-component/README.md#migrating-from-postgresql-17-to-18 (or run `bun platform/pglite-component/scripts/migrate-17-to-18.ts`)
 ```
 
-The provider does not convert directories between major versions; it bundles
-neither a second engine nor `pg_upgrade`. To move a database across a major
-version:
+### Migrating from PostgreSQL 17 to 18
 
-1. Stop every writer. Keep the provider version that wrote the directory,
-   pinned by its digest or npm version, and back up the whole root.
-2. With that provider, export the data through the application, for example
-   with a migration step that reads each table through the `database`
-   interface into a portable format.
-3. Deploy the new provider on a new, empty root, and recreate the schema with
-   the application's migrations.
-4. Import the exported data, check it, then retire the old root.
+The provider does not convert directories in place between major versions; it
+bundles neither a second engine nor `pg_upgrade` (roadmap decision D03, option (b)).
+Use `scripts/migrate-17-to-18.ts` to logically export a PostgreSQL 17 mount root
+(using the pinned 17.x provider) and import it into a fresh PostgreSQL 18 mount
+root (using this 18.6 provider):
 
-If the root is encrypted with `pglite-encfs`, compose encfs with the same key
-for both the export and the import. PostgreSQL 18 is tracked in #401.
+```sh
+# 1. Stop every writer and back up the PostgreSQL 17 mount directory.
+cp -R ./data-pg17 ./data-pg17.backup
+
+# 2. Export the 17 cluster and import it into a new 18 mount directory
+#    (optionally keeping a copy of the logical SQL dump with --dump, or
+#    selecting an explicit database with --database <postgres|template1>).
+bun platform/pglite-component/scripts/migrate-17-to-18.ts \
+  --from ./data-pg17 \
+  --to ./data-pg18
+
+# 3. Point the workload mount at ./data-pg18, verify the application, and retire ./data-pg17.
+```
+
+What `scripts/migrate-17-to-18.ts` does:
+1. Validates that `<from>/pglite/data/PG_VERSION` is `17` and refuses to overwrite
+   `<to>` if `<to>/pglite/data/PG_VERSION` already exists.
+2. When `--database` is not specified, checks that the non-default sibling
+   database (`postgres` or `template1`) has no user objects in `public` so data
+   written via explicit `open-options.database` is never silently skipped.
+3. Composes the pinned PostgreSQL 17 provider (`PGLITE_UPGRADE_FROM_*` in
+   `scripts/tool-versions.env`) and runs it in `export-sql` mode into a
+   temporary directory (removed automatically in `finally`) to dump installed
+   extensions (`pgcrypto`), `public` sequences, `public` tables (including
+   `serial`, `GENERATED ... AS IDENTITY`, and `GENERATED ALWAYS AS (...) STORED`
+   columns), `PRIMARY KEY`/`UNIQUE`/`CHECK` constraints, table rows (with
+   lossless typed literals including `bytea` ciphertext), sequence values
+   (`setval`), `FOREIGN KEY` constraints, standalone indexes, `public` views,
+   and user-defined `public` functions. If `public` contains unsupported objects
+   (such as triggers, procedures, materialized views, or partitioned tables),
+   export fails closed instead of silently omitting them.
+4. Composes this PostgreSQL 18.6 provider and runs it in `import-sql` mode on
+   `<to>`, which initializes a new PostgreSQL 18 cluster (with
+   `data_checksums = on` and the `di-framework-database` marker when importing
+   into `postgres`) and executes the SQL dump inside a single transaction
+   followed by `CHECKPOINT`. If export or import fails, any partially created
+   `<to>/pglite` state is cleaned up automatically.
+
+If your application manages custom schemas outside `public` or uses objects
+outside the exporter's scope, export through your application under the 17.x
+provider, deploy this 18.6 provider on an empty root, run your application
+migrations, and import the exported data. Note that `scripts/migrate-17-to-18.ts`
+mounts `<from>` and `<to>` as raw host directories in Wasmtime (`wasi:filesystem`);
+for roots encrypted with `pglite-encfs`, run the export and import through a
+component composed with `pglite-encfs` (and the same encryption key) rather than
+passing raw ciphertext directories to `--from`.
 
 ## Implementation
 
@@ -537,10 +581,12 @@ for both the export and the import. PostgreSQL 18 is tracked in #401.
 - `src/lib.rs`: public WIT resources and connection lifecycle.
 - `src/pgwire.rs`: PostgreSQL message encoding and typed rows, over memory.
 - `src/engine.rs`: persistent filesystem setup, exclusive engine access, and the application database choice (marker, crash windows).
+- `src/checksums.rs`: 16-bit FNV-1a page checksums (`data_checksums`) and `global/pg_control` CRC-32C updates on newly initialized clusters (#537).
 - `engine/bridge.wat`: private canonical ABI bridge to the core engine.
 - `engine/build-pgcrypto.sh`: builds OpenSSL libcrypto and pgcrypto in the engine container and generates pgcrypto's static `dlsym` table; `scripts/patch-engine-source.ts` links both into the engine. The libcrypto build is cached under a key of the OpenSSL source tarball's sha256, the Configure options and `SOURCE_DATE_EPOCH`, so an OpenSSL version bump always rebuilds it.
 - `scripts/patch-engine-source.ts`: also replaces the upstream `dlopen` emulation's unbounded table (`dltab`) with the bounded one described under [Extensions](#extensions), and keeps pgcrypto's hook ahead of it.
-- `engine/patches/postgresql-17.11-wasi.patch`: Electric's 17.5 WASI changes replayed onto upstream `REL_17_11`; see [engine/patches/README.md](engine/patches/README.md).
+- `engine/patches/postgresql-18.6-wasi.patch`: Electric's 17.5 WASI changes replayed onto upstream `REL_18_6` (#401); see [engine/patches/README.md](engine/patches/README.md).
+- `scripts/migrate-17-to-18.ts`: logical export/import tool for migrating a PostgreSQL 17 mount directory to PostgreSQL 18 (#401).
 - `scripts/build-engine.ts`: builds the engine source tree (pinned tag, checked commit, checked patches) and runs the wasipg container build; `scripts/check-engine-patch.ts` (`make check-engine-patch`) runs the same source steps without the build.
 - `scripts/prepare-engine.ts`: pinned engine preparation and componentization (all build scripts are Bun TypeScript; see `scripts/`).
 - `wit/deps/pglite-engine/engine.wit`: internal interface, composed away at build.

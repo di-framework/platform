@@ -31,8 +31,10 @@ const CONTROL_BLCKSZ_OFFSET: usize = 216;
 /// Byte offset of `data_checksum_version` (`uint32`) in `ControlFileData`.
 const CONTROL_CHECKSUM_VERSION_OFFSET: usize = 252;
 
-/// Byte offset of `crc` (`pg_crc32c`) in `ControlFileData` on 32-bit/WASI and 64-bit targets.
-const CONTROL_CRC_OFFSET: usize = 288;
+/// Byte offset of `crc` (`pg_crc32c`) in PostgreSQL 18 `ControlFileData` (`PG_CONTROL_VERSION = 1800`),
+/// following `data_checksum_version` (`252..256`), `default_char_signedness` (`256`),
+/// `mock_authentication_nonce[32]` (`257..289`), and 3 bytes of alignment padding (`289..292`).
+const CONTROL_CRC_OFFSET: usize = 292;
 
 /// Minimum bytes needed to inspect and update `ControlFileData` through `crc`.
 const CONTROL_MIN_LEN: usize = CONTROL_CRC_OFFSET + 4;
@@ -364,8 +366,8 @@ mod tests {
 
     fn sample_control_file(version: u32) -> Vec<u8> {
         let mut buf = vec![0u8; BLCKSZ];
-        // pg_control_version = 1700 at offset 8
-        buf[8..12].copy_from_slice(&1700u32.to_le_bytes());
+        // pg_control_version = 1800 at offset 8
+        buf[8..12].copy_from_slice(&1800u32.to_le_bytes());
         // blcksz = 8192 at offset 216
         buf[CONTROL_BLCKSZ_OFFSET..CONTROL_BLCKSZ_OFFSET + 4]
             .copy_from_slice(&(BLCKSZ as u32).to_le_bytes());
@@ -464,7 +466,7 @@ mod tests {
         fs::create_dir_all(data.join("base/5")).unwrap();
         fs::write(data.join("global/pg_control"), sample_control_file(0)).unwrap();
         fs::write(data.join("global/pg_filenode.map"), [1u8; 524]).unwrap();
-        fs::write(data.join("base/5/PG_VERSION"), "17\n").unwrap();
+        fs::write(data.join("base/5/PG_VERSION"), "18\n").unwrap();
         fs::write(data.join("base/5/1259_vm"), []).unwrap();
 
         let mut rel = vec![0u8; BLCKSZ * 2];

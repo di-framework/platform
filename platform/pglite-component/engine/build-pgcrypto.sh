@@ -106,7 +106,7 @@ OBJS=$(sed -n '/^OBJS = /,/^$/p' "$SRC/Makefile" | grep -o '[a-z0-9-]*\.o' | gre
 [ -n "$OBJS" ] || { echo "pgcrypto: no objects found in $SRC/Makefile" >&2; exit 1; }
 # shellcheck disable=SC2086
 WASI_CFLAGS="$CC_PGLITE" make -C "$OUT" PORTNAME=wasi wasi=1 \
-  PG_CPPFLAGS="-I$OSSL_PREFIX/include" $OBJS >/dev/null
+  PG_CPPFLAGS="-I$OSSL_PREFIX/include -D_PG_init=df_pgcrypto_PG_init" $OBJS >/dev/null
 
 # --- dlsym table ------------------------------------------------------------
 # Every C symbol pgcrypto's install script binds with 'MODULE_PATHNAME', plus
@@ -119,6 +119,7 @@ SYMS=$(sed -n "s/.*'MODULE_PATHNAME', *'\([a-z0-9_]*\)'.*/\1/p" "$SRC"/pgcrypto-
   echo '#include "postgres.h"'
   echo '#include "fmgr.h"'
   echo '#include <string.h>'
+  echo 'extern void df_pgcrypto_PG_init(void);'
   for s in $SYMS; do
     echo "extern Datum $s(PG_FUNCTION_ARGS);"
     echo "extern const Pg_finfo_record *pg_finfo_$s(void);"
@@ -144,8 +145,16 @@ df_ends_with(const char *s, const char *suffix)
 void *
 df_ext_dlopen(const char *filename)
 {
-	return filename && df_ends_with(filename, "/pgcrypto.so") ?
-		(void *) &df_pgcrypto_handle : NULL;
+	static int	initialized = 0;
+
+	if (!filename || !df_ends_with(filename, "/pgcrypto.so"))
+		return NULL;
+	if (!initialized)
+	{
+		initialized = 1;
+		df_pgcrypto_PG_init();
+	}
+	return (void *) &df_pgcrypto_handle;
 }
 
 /* dlsym hook: pgcrypto's SQL-callable functions and fmgr info records. */

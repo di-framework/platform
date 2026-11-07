@@ -1,14 +1,15 @@
-PostgreSQL WASI build: Electric's 17.5 WASI changes replayed onto upstream REL_17_11.
+PostgreSQL WASI build: Electric's 17.5 WASI changes replayed onto upstream REL_18_6.
 
-Base:   https://github.com/postgres/postgres  tag REL_17_11
-        commit 083ac033419f690758508e08c1736089384bbee8
+Base:   https://github.com/postgres/postgres  tag REL_18_6
+        commit 724edf9bde9d356724ad384a2e196edc3c9f80f7
 Source: https://github.com/electric-sql/postgres-pglite
         REL_17_5 (5e2f3df49d4298c6097789364a5a53be172f6e85, = upstream REL_17_5)
         -> REL_17_5_WASM-pglite (2194acf356e9b7bf7cff29c4ed4bd6b82b93895d)
 
-Produced by `git apply --3way` of `git diff REL_17_5 2194acf` onto REL_17_11,
-then `git diff REL_17_11` of the result: 118 files, no binary files, no
-conflicts. See README.md in this directory for regeneration steps.
+Produced by `git apply --3way` of `git diff REL_17_5 2194acf` onto REL_18_6,
+resolving the 18.x conflicts and single-user/AIO/cancel-key updates, then
+`git diff REL_18_6` of the result: 119 files, no binary files. See README.md
+in this directory for regeneration steps.
 
 This file is a diff against PostgreSQL / postgres-pglite source and is
 governed by the PostgreSQL License (see engine/POSTGRESQL-COPYRIGHT), not by
@@ -18,7 +19,7 @@ git apply skips everything above the first "diff --git" line.
 
 diff --git a/.buildconfig b/.buildconfig
 new file mode 100644
-index 00000000..a518dff8
+index 0000000..a518dff
 --- /dev/null
 +++ b/.buildconfig
 @@ -0,0 +1,7 @@
@@ -30,7 +31,7 @@ index 00000000..a518dff8
 +ZIC=/usr/sbin/zic
 +
 diff --git a/.gitignore b/.gitignore
-index 4e911395..e76ef7cc 100644
+index 4e91139..e76ef7c 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -43,3 +43,4 @@ lib*.pc
@@ -39,7 +40,7 @@ index 4e911395..e76ef7cc 100644
  /portlock/
 +/dist
 diff --git a/contrib/pgcrypto/Makefile b/contrib/pgcrypto/Makefile
-index ff5e0ece..4b7c150d 100644
+index 17d2b0c..b1ff6f7 100644
 --- a/contrib/pgcrypto/Makefile
 +++ b/contrib/pgcrypto/Makefile
 @@ -62,6 +62,9 @@ endif
@@ -50,13 +51,13 @@ index ff5e0ece..4b7c150d 100644
 +SHLIB_LINK += -lcrypto
 +endif
  ifeq ($(PORTNAME), win32)
- SHLIB_LINK += $(filter -leay32, $(LIBS))
  # those must be at the end
+ SHLIB_LINK += -lws2_32
 diff --git a/contrib/pgstattuple/pgstatindex.c b/contrib/pgstattuple/pgstatindex.c
-index 5c06ba6d..0ea74cef 100644
+index 4b9d76e..72b91e1 100644
 --- a/contrib/pgstattuple/pgstatindex.c
 +++ b/contrib/pgstattuple/pgstatindex.c
-@@ -656,9 +656,9 @@ pgstathashindex(PG_FUNCTION_ARGS)
+@@ -653,9 +653,9 @@ pgstathashindex(PG_FUNCTION_ARGS)
  			stats.unused_pages++;
  		else if (PageGetSpecialSize(page) !=
  				 MAXALIGN(sizeof(HashPageOpaqueData)))
@@ -69,10 +70,10 @@ index 5c06ba6d..0ea74cef 100644
  							BufferGetBlockNumber(buf))));
  		else
 diff --git a/contrib/xml2/Makefile b/contrib/xml2/Makefile
-index 0d703fe0..926649f6 100644
+index 8597e9a..65a8469 100644
 --- a/contrib/xml2/Makefile
 +++ b/contrib/xml2/Makefile
-@@ -11,7 +11,7 @@ DATA = xml2--1.1.sql xml2--1.0--1.1.sql
+@@ -13,7 +13,7 @@ DATA = xml2--1.1.sql \
  PGFILEDESC = "xml2 - XPath querying and XSLT"
  
  REGRESS = xml2
@@ -83,7 +84,7 @@ index 0d703fe0..926649f6 100644
  ifdef USE_PGXS
 diff --git a/extra/pg_ivm.sh b/extra/pg_ivm.sh
 new file mode 100755
-index 00000000..5b3121e3
+index 0000000..5b3121e
 --- /dev/null
 +++ b/extra/pg_ivm.sh
 @@ -0,0 +1,43 @@
@@ -132,7 +133,7 @@ index 00000000..5b3121e3
 +
 diff --git a/extra/pg_uuidv7.sh b/extra/pg_uuidv7.sh
 new file mode 100755
-index 00000000..078aaa75
+index 0000000..078aaa7
 --- /dev/null
 +++ b/extra/pg_uuidv7.sh
 @@ -0,0 +1,25 @@
@@ -163,7 +164,7 @@ index 00000000..078aaa75
 +
 diff --git a/extra/vector.sh b/extra/vector.sh
 new file mode 100755
-index 00000000..4dd86666
+index 0000000..4dd8666
 --- /dev/null
 +++ b/extra/vector.sh
 @@ -0,0 +1,27 @@
@@ -196,7 +197,7 @@ index 00000000..4dd86666
 +
 diff --git a/out/.gitignore b/out/.gitignore
 new file mode 100644
-index 00000000..5e7d2734
+index 0000000..5e7d273
 --- /dev/null
 +++ b/out/.gitignore
 @@ -0,0 +1,4 @@
@@ -206,7 +207,7 @@ index 00000000..5e7d2734
 +!.gitignore
 diff --git a/pglite-wasm/build.sh b/pglite-wasm/build.sh
 new file mode 100755
-index 00000000..bb97a96a
+index 0000000..bb97a96
 --- /dev/null
 +++ b/pglite-wasm/build.sh
 @@ -0,0 +1,338 @@
@@ -550,7 +551,7 @@ index 00000000..bb97a96a
 +
 diff --git a/pglite-wasm/interactive_one.c b/pglite-wasm/interactive_one.c
 new file mode 100644
-index 00000000..fc359096
+index 0000000..1b45aa8
 --- /dev/null
 +++ b/pglite-wasm/interactive_one.c
 @@ -0,0 +1,751 @@
@@ -912,7 +913,7 @@ index 00000000..fc359096
 +        StringInfoData buf;
 +        pq_beginmessage(&buf, 'K');
 +        pq_sendint32(&buf, (int32) MyProcPid);
-+        pq_sendint32(&buf, (int32) MyCancelKey);
++        pq_sendbytes(&buf, MyCancelKey, MyCancelKeyLength > 0 ? MyCancelKeyLength : 4);
 +        pq_endmessage(&buf);
 +    }
 +PDEBUG("# 330: TODO: set a pgl started flag");
@@ -1307,7 +1308,7 @@ index 00000000..fc359096
 +#undef PGL_LOOP
 diff --git a/pglite-wasm/native.sh b/pglite-wasm/native.sh
 new file mode 100755
-index 00000000..6b3777ae
+index 0000000..6b3777a
 --- /dev/null
 +++ b/pglite-wasm/native.sh
 @@ -0,0 +1,189 @@
@@ -1502,10 +1503,10 @@ index 00000000..6b3777ae
 +
 diff --git a/pglite-wasm/pg_main.c b/pglite-wasm/pg_main.c
 new file mode 100644
-index 00000000..65e5d7ac
+index 0000000..b57c6c3
 --- /dev/null
 +++ b/pglite-wasm/pg_main.c
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,595 @@
 +
 +// for handling REVOKE exception in initdb
 +#if defined(__wasi__) || defined(__EMSCRIPTEN__)
@@ -1977,6 +1978,7 @@ index 00000000..65e5d7ac
 +            "-d", "3",
 +            WASM_PGOPTS,
 +            "-X", "1048576",
++            "-k",
 +            NULL
 +        };
 +        int boot_argc = sizeof(boot_argv) / sizeof(char *) - 1;
@@ -2102,7 +2104,7 @@ index 00000000..65e5d7ac
 +}
 diff --git a/pglite-wasm/pg_proto.c b/pglite-wasm/pg_proto.c
 new file mode 100644
-index 00000000..fd21210f
+index 0000000..fd21210
 --- /dev/null
 +++ b/pglite-wasm/pg_proto.c
 @@ -0,0 +1,343 @@
@@ -2451,7 +2453,7 @@ index 00000000..fd21210f
 +
 diff --git a/pglite-wasm/pgl_initdb.c b/pglite-wasm/pgl_initdb.c
 new file mode 100644
-index 00000000..19bf7fd4
+index 0000000..19bf7fd
 --- /dev/null
 +++ b/pglite-wasm/pgl_initdb.c
 @@ -0,0 +1,58 @@
@@ -2515,10 +2517,10 @@ index 00000000..19bf7fd4
 +
 diff --git a/pglite-wasm/pgl_mains.c b/pglite-wasm/pgl_mains.c
 new file mode 100644
-index 00000000..98f425a6
+index 0000000..f040a66
 --- /dev/null
 +++ b/pglite-wasm/pgl_mains.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,458 @@
 +#include <setjmp.h>
 +
 +volatile int sf_connected = 0;
@@ -2835,6 +2837,16 @@ index 00000000..98f425a6
 +
 +	/* Initialize MaxBackends */
 +	InitializeMaxBackends();
++
++	/*
++	 * We don't need postmaster child slots in single-user mode, but
++	 * initialize them anyway to avoid having special handling.
++	 */
++	InitPostmasterChildSlots();
++
++	/* Initialize size of fast-path lock cache. */
++	InitializeFastPathLocks();
++
 +PDEBUG("# 127"); /* on_shmem_exit stubs call start here */
 +	/*
 +	 * Give preloaded libraries a chance to request additional shared memory.
@@ -2855,6 +2867,12 @@ index 00000000..98f425a6
 +	InitializeWalConsistencyChecking();
 +
 +	CreateSharedMemoryAndSemaphores();
++
++	/*
++	 * Estimate number of openable files.  This must happen after setting up
++	 * semaphores, because on some platforms semaphores count as open files.
++	 */
++	set_max_safe_fds();
 +
 +	/*
 +	 * Remember stand-alone backend startup time,roughly at the same point
@@ -2931,7 +2949,7 @@ index 00000000..98f425a6
 +
 +		pq_beginmessage(&buf, 'K');
 +		pq_sendint32(&buf, (int32) MyProcPid);
-+		pq_sendint32(&buf, (int32) MyCancelKey);
++		pq_sendbytes(&buf, MyCancelKey, MyCancelKeyLength > 0 ? MyCancelKeyLength : 4);
 +		pq_endmessage(&buf);
 +		/* Need not flush since ReadyForQuery will do it. */
 +	}
@@ -2963,7 +2981,7 @@ index 00000000..98f425a6
 +
 diff --git a/pglite-wasm/pgl_os.h b/pglite-wasm/pgl_os.h
 new file mode 100644
-index 00000000..a8a30e54
+index 0000000..a8a30e5
 --- /dev/null
 +++ b/pglite-wasm/pgl_os.h
 @@ -0,0 +1,55 @@
@@ -3024,7 +3042,7 @@ index 00000000..a8a30e54
 +
 diff --git a/pglite-wasm/pgl_sjlj.c b/pglite-wasm/pgl_sjlj.c
 new file mode 100644
-index 00000000..6c05dafa
+index 0000000..6c05daf
 --- /dev/null
 +++ b/pglite-wasm/pgl_sjlj.c
 @@ -0,0 +1,76 @@
@@ -3106,10 +3124,10 @@ index 00000000..6c05dafa
 +
 diff --git a/pglite-wasm/pgl_stubs.h b/pglite-wasm/pgl_stubs.h
 new file mode 100644
-index 00000000..2ad262c7
+index 0000000..2ad262c
 --- /dev/null
 +++ b/pglite-wasm/pgl_stubs.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,161 @@
 +#pragma once
 +
 +
@@ -3147,6 +3165,28 @@ index 00000000..2ad262c7
 +#ifdef PG16
 +    SpinLockInit(&dummy_spinlock);
 +#endif
++}
++
++static const char *const DispatchOptionNames[] =
++{
++	[DISPATCH_CHECK] = "check",
++	[DISPATCH_BOOT] = "boot",
++	[DISPATCH_FORKCHILD] = "forkchild",
++	[DISPATCH_DESCRIBE_CONFIG] = "describe-config",
++	[DISPATCH_SINGLE] = "single",
++};
++
++DispatchOption
++parse_dispatch_option(const char *name)
++{
++	for (int i = 0; i < lengthof(DispatchOptionNames); i++)
++	{
++		if (i == DISPATCH_FORKCHILD)
++			continue;
++		if (strcmp(DispatchOptionNames[i], name) == 0)
++			return (DispatchOption) i;
++	}
++	return DISPATCH_POSTMASTER;
 +}
 +
 +
@@ -3251,7 +3291,7 @@ index 00000000..2ad262c7
 +#endif
 diff --git a/pglite-wasm/pgl_tools.h b/pglite-wasm/pgl_tools.h
 new file mode 100644
-index 00000000..295586f6
+index 0000000..295586f
 --- /dev/null
 +++ b/pglite-wasm/pgl_tools.h
 @@ -0,0 +1,83 @@
@@ -3340,7 +3380,7 @@ index 00000000..295586f6
 +
 diff --git a/pglite-wasm/pglite-modpython.c b/pglite-wasm/pglite-modpython.c
 new file mode 100644
-index 00000000..8dc492ea
+index 0000000..8dc492e
 --- /dev/null
 +++ b/pglite-wasm/pglite-modpython.c
 @@ -0,0 +1,218 @@
@@ -3564,7 +3604,7 @@ index 00000000..8dc492ea
 +}
 diff --git a/pglite-wasm/repl.html b/pglite-wasm/repl.html
 new file mode 100644
-index 00000000..15e9ed2d
+index 0000000..15e9ed2
 --- /dev/null
 +++ b/pglite-wasm/repl.html
 @@ -0,0 +1,1226 @@
@@ -4796,9 +4836,9 @@ index 00000000..15e9ed2d
 +</html>
 diff --git a/postgresql-REL_17_5_WASM.patched b/postgresql-REL_17_5_WASM.patched
 new file mode 100644
-index 00000000..e69de29b
+index 0000000..e69de29
 diff --git a/src/Makefile.shlib b/src/Makefile.shlib
-index fa81f6ff..aed880df 100644
+index 3825af5..21d018e 100644
 --- a/src/Makefile.shlib
 +++ b/src/Makefile.shlib
 @@ -224,6 +224,33 @@ ifeq ($(SHLIB_EXPORTS),)
@@ -4849,7 +4889,7 @@ index fa81f6ff..aed880df 100644
  # In this rule, "touch $@" works around a problem on some platforms wherein
  # ar updates the library file's mod time with a value calculated to
 diff --git a/src/backend/Makefile b/src/backend/Makefile
-index f2dae698..03cc8b49 100644
+index c0be941..935f60e 100644
 --- a/src/backend/Makefile
 +++ b/src/backend/Makefile
 @@ -37,9 +37,11 @@ LOCALOBJS += utils/probes.o
@@ -4866,7 +4906,7 @@ index f2dae698..03cc8b49 100644
  	$(top_builddir)/src/common/libpgcommon_srv.a \
  	$(top_builddir)/src/port/libpgport_srv.a
  
-@@ -60,6 +62,7 @@ override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
+@@ -61,6 +63,7 @@ override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
  
  all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
  
@@ -4874,7 +4914,7 @@ index f2dae698..03cc8b49 100644
  ifneq ($(PORTNAME), cygwin)
  ifneq ($(PORTNAME), win32)
  
-@@ -68,6 +71,37 @@ postgres: $(OBJS)
+@@ -69,6 +72,37 @@ postgres: $(OBJS)
  
  endif
  endif
@@ -4913,10 +4953,10 @@ index f2dae698..03cc8b49 100644
  ifeq ($(PORTNAME), cygwin)
  
 diff --git a/src/backend/access/nbtree/nbtutils.c b/src/backend/access/nbtree/nbtutils.c
-index c7339597..6bade1f2 100644
+index 7e166de..9c5f0c3 100644
 --- a/src/backend/access/nbtree/nbtutils.c
 +++ b/src/backend/access/nbtree/nbtutils.c
-@@ -5168,7 +5168,7 @@ _bt_allequalimage(Relation rel, bool debugmessage)
+@@ -4287,7 +4287,7 @@ _bt_allequalimage(Relation rel, bool debugmessage)
  			break;
  		}
  	}
@@ -4925,7 +4965,7 @@ index c7339597..6bade1f2 100644
  	if (debugmessage)
  	{
  		if (allequalimage)
-@@ -5178,6 +5178,6 @@ _bt_allequalimage(Relation rel, bool debugmessage)
+@@ -4297,6 +4297,6 @@ _bt_allequalimage(Relation rel, bool debugmessage)
  			elog(DEBUG1, "index \"%s\" cannot use deduplication",
  				 RelationGetRelationName(rel));
  	}
@@ -4934,10 +4974,10 @@ index c7339597..6bade1f2 100644
  	return allequalimage;
  }
 diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
-index 053a200d..f3fcb2c1 100644
+index b885513..466e580 100644
 --- a/src/backend/access/transam/xact.c
 +++ b/src/backend/access/transam/xact.c
-@@ -1771,6 +1771,7 @@ RecordTransactionAbort(bool isSubXact)
+@@ -1792,6 +1792,7 @@ RecordTransactionAbort(bool isSubXact)
  	if (TransactionIdDidCommit(xid))
  		elog(PANIC, "cannot abort transaction %u, it was already committed",
  			 xid);
@@ -4945,7 +4985,7 @@ index 053a200d..f3fcb2c1 100644
  
  	/*
  	 * Are we using the replication origins feature?  Or, in other words, are
-@@ -2814,7 +2815,9 @@ AbortTransaction(void)
+@@ -2866,7 +2867,9 @@ AbortTransaction(void)
  	 * handler.  We do this fairly early in the sequence so that the timeout
  	 * infrastructure will be functional if needed while aborting.
  	 */
@@ -4955,7 +4995,7 @@ index 053a200d..f3fcb2c1 100644
  
  	/*
  	 * check the current transaction state
-@@ -5221,7 +5224,10 @@ AbortSubTransaction(void)
+@@ -5271,7 +5274,10 @@ AbortSubTransaction(void)
  	 * handler.  We do this fairly early in the sequence so that the timeout
  	 * infrastructure will be functional if needed while aborting.
  	 */
@@ -4967,7 +5007,7 @@ index 053a200d..f3fcb2c1 100644
  	/*
  	 * check the current transaction state
 diff --git a/src/backend/access/transam/xlogarchive.c b/src/backend/access/transam/xlogarchive.c
-index 81999b48..8e3b1f04 100644
+index 1ef1713..6335d9b 100644
 --- a/src/backend/access/transam/xlogarchive.c
 +++ b/src/backend/access/transam/xlogarchive.c
 @@ -32,6 +32,10 @@
@@ -4982,10 +5022,10 @@ index 81999b48..8e3b1f04 100644
   * Attempt to retrieve the specified file from off-line archival storage.
   * If successful, fill "path" with its complete path (note that this will be
 diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
-index 986f6f1d..8b226b21 100644
+index 6db8648..bf44700 100644
 --- a/src/backend/bootstrap/bootstrap.c
 +++ b/src/backend/bootstrap/bootstrap.c
-@@ -195,7 +195,11 @@ CheckerModeMain(void)
+@@ -194,7 +194,11 @@ CheckerModeMain(void)
   *	 to shared memory sizing, options work (or at least do not cause an error
   *	 up to shared memory creation).
   */
@@ -4997,7 +5037,7 @@ index 986f6f1d..8b226b21 100644
  BootstrapModeMain(int argc, char *argv[], bool check_only)
  {
  	int			i;
-@@ -365,7 +369,12 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
+@@ -397,7 +401,12 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
  
  	/* Clean up and exit */
  	cleanup();
@@ -5011,10 +5051,10 @@ index 986f6f1d..8b226b21 100644
  
  
 diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
-index 192d6144..65c8084a 100644
+index 898814d..41d2ced 100644
 --- a/src/backend/catalog/index.c
 +++ b/src/backend/catalog/index.c
-@@ -3003,7 +3003,7 @@ index_build(Relation heapRelation,
+@@ -3058,7 +3058,7 @@ index_build(Relation heapRelation,
  		indexInfo->ii_ParallelWorkers =
  			plan_create_index_workers(RelationGetRelid(heapRelation),
  									  RelationGetRelid(indexRelation));
@@ -5023,7 +5063,7 @@ index 192d6144..65c8084a 100644
  	if (indexInfo->ii_ParallelWorkers == 0)
  		ereport(DEBUG1,
  				(errmsg_internal("building index \"%s\" on table \"%s\" serially",
-@@ -3015,7 +3015,7 @@ index_build(Relation heapRelation,
+@@ -3070,7 +3070,7 @@ index_build(Relation heapRelation,
  								 RelationGetRelationName(indexRelation),
  								 RelationGetRelationName(heapRelation),
  								 indexInfo->ii_ParallelWorkers)));
@@ -5033,7 +5073,7 @@ index 192d6144..65c8084a 100644
  	 * Switch to the table owner's userid, so that any index functions are run
  	 * as that user.  Also lock down security-restricted operations and
 diff --git a/src/backend/commands/async.c b/src/backend/commands/async.c
-index b788ac45..ff443bcf 100644
+index e1cf659..4049155 100644
 --- a/src/backend/commands/async.c
 +++ b/src/backend/commands/async.c
 @@ -1651,8 +1651,12 @@ SignalBackends(void)
@@ -5050,10 +5090,10 @@ index b788ac45..ff443bcf 100644
  
  	pfree(pids);
 diff --git a/src/backend/commands/collationcmds.c b/src/backend/commands/collationcmds.c
-index 63ef9a08..3167e66a 100644
+index 8acbfbb..bc5a129 100644
 --- a/src/backend/commands/collationcmds.c
 +++ b/src/backend/commands/collationcmds.c
-@@ -868,14 +868,14 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
+@@ -864,14 +864,14 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
  		maxaliases = 100;
  		aliases = (CollAliasData *) palloc(maxaliases * sizeof(CollAliasData));
  		naliases = 0;
@@ -5072,10 +5112,10 @@ index 63ef9a08..3167e66a 100644
  		{
  			size_t		len;
 diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
-index f529e0ff..d13f3966 100644
+index 5eb6caf..f5a682b 100644
 --- a/src/backend/commands/dbcommands.c
 +++ b/src/backend/commands/dbcommands.c
-@@ -1834,8 +1834,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
+@@ -1873,8 +1873,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
  	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
  
  	/* Close all smgr fds in all backends. */
@@ -5087,7 +5127,7 @@ index f529e0ff..d13f3966 100644
  	 * Remove all tablespace subdirs belonging to the database.
  	 */
 diff --git a/src/backend/commands/event_trigger.c b/src/backend/commands/event_trigger.c
-index ea934feb..b0a51669 100644
+index 0ff8867..6f52916 100644
 --- a/src/backend/commands/event_trigger.c
 +++ b/src/backend/commands/event_trigger.c
 @@ -727,6 +727,7 @@ EventTriggerDDLCommandStart(Node *parsetree)
@@ -5191,29 +5231,29 @@ index ea934feb..b0a51669 100644
  	 * Also do nothing if our state isn't set up, which it won't be if there
  	 * weren't any relevant event triggers at the start of the current DDL
 diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
-index 4a96d3ba..423f5c37 100644
+index 40b6f93..2125905 100644
 --- a/src/backend/libpq/auth.c
 +++ b/src/backend/libpq/auth.c
-@@ -1864,7 +1864,7 @@ auth_peer(hbaPort *port)
+@@ -1857,7 +1857,7 @@ auth_peer(hbaPort *port)
  {
  	uid_t		uid;
  	gid_t		gid;
 -#ifndef WIN32
 +#if !defined(WIN32) && !defined(__wasi__)
+ 	struct passwd pwbuf;
  	struct passwd *pw;
- 	int			ret;
- #endif
-@@ -1883,7 +1883,7 @@ auth_peer(hbaPort *port)
+ 	char		buf[1024];
+@@ -1879,7 +1879,7 @@ auth_peer(hbaPort *port)
  		return STATUS_ERROR;
  	}
  
 -#ifndef WIN32
 +#if !defined(WIN32) && !defined(__wasi__)
- 	errno = 0;					/* clear errno before call */
- 	pw = getpwuid(uid);
- 	if (!pw)
+ 	rc = getpwuid_r(uid, &pwbuf, buf, sizeof buf, &pw);
+ 	if (rc != 0)
+ 	{
 diff --git a/src/backend/libpq/be-fsstubs.c b/src/backend/libpq/be-fsstubs.c
-index 27d317df..afc579fd 100644
+index e5a34c6..2fb3e23 100644
 --- a/src/backend/libpq/be-fsstubs.c
 +++ b/src/backend/libpq/be-fsstubs.c
 @@ -150,8 +150,12 @@ be_lo_close(PG_FUNCTION_ARGS)
@@ -5253,7 +5293,7 @@ index 27d317df..afc579fd 100644
  	if ((lobj->flags & IFS_WRLOCK) == 0)
  		ereport(ERROR,
  				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-@@ -365,7 +373,7 @@ be_loread(PG_FUNCTION_ARGS)
+@@ -370,7 +378,7 @@ be_loread(PG_FUNCTION_ARGS)
  		len = 0;
  
  	retval = (bytea *) palloc(VARHDRSZ + len);
@@ -5262,7 +5302,7 @@ index 27d317df..afc579fd 100644
  	SET_VARSIZE(retval, totalread + VARHDRSZ);
  
  	PG_RETURN_BYTEA_P(retval);
-@@ -382,7 +390,7 @@ be_lowrite(PG_FUNCTION_ARGS)
+@@ -387,7 +395,7 @@ be_lowrite(PG_FUNCTION_ARGS)
  	PreventCommandIfReadOnly("lowrite()");
  
  	bytestowrite = VARSIZE_ANY_EXHDR(wbuf);
@@ -5271,7 +5311,7 @@ index 27d317df..afc579fd 100644
  	PG_RETURN_INT32(totalwritten);
  }
  
-@@ -560,7 +568,7 @@ lo_truncate_internal(int32 fd, int64 len)
+@@ -565,7 +573,7 @@ lo_truncate_internal(int32 fd, int64 len)
  				 errmsg("invalid large-object descriptor: %d", fd)));
  	lobj = cookies[fd];
  
@@ -5281,10 +5321,10 @@ index 27d317df..afc579fd 100644
  		ereport(ERROR,
  				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 diff --git a/src/backend/libpq/pqcomm.c b/src/backend/libpq/pqcomm.c
-index daa06961..ff5277a6 100644
+index e517146..edd24e3 100644
 --- a/src/backend/libpq/pqcomm.c
 +++ b/src/backend/libpq/pqcomm.c
-@@ -122,10 +122,23 @@ static char *PqSendBuffer;
+@@ -123,10 +123,23 @@ static char *PqSendBuffer;
  static int	PqSendBufferSize;	/* Size send buffer */
  static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
  static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
@@ -5309,7 +5349,7 @@ index daa06961..ff5277a6 100644
  
  /*
   * Message status
-@@ -135,6 +148,7 @@ static bool PqCommReadingMsg;	/* in the middle of reading a message */
+@@ -136,6 +149,7 @@ static bool PqCommReadingMsg;	/* in the middle of reading a message */
  
  
  /* Internal functions */
@@ -5317,7 +5357,7 @@ index daa06961..ff5277a6 100644
  static void socket_comm_reset(void);
  static void socket_close(int code, Datum arg);
  static void socket_set_nonblocking(bool nonblocking);
-@@ -148,9 +162,6 @@ static inline int internal_flush(void);
+@@ -149,9 +163,6 @@ static inline int internal_flush(void);
  static pg_noinline int internal_flush_buffer(const char *buf, size_t *start,
  											 size_t *end);
  
@@ -5327,7 +5367,7 @@ index daa06961..ff5277a6 100644
  static const PQcommMethods PqCommSocketMethods = {
  	.comm_reset = socket_comm_reset,
  	.flush = socket_flush,
-@@ -160,6 +171,10 @@ static const PQcommMethods PqCommSocketMethods = {
+@@ -161,6 +172,10 @@ static const PQcommMethods PqCommSocketMethods = {
  	.putmessage_noblock = socket_putmessage_noblock
  };
  
@@ -5338,7 +5378,7 @@ index daa06961..ff5277a6 100644
  const PQcommMethods *PqCommMethods = &PqCommSocketMethods;
  
  WaitEventSet *FeBeWaitSet;
-@@ -181,7 +196,7 @@ pq_init(ClientSocket *client_sock)
+@@ -182,7 +197,7 @@ pq_init(ClientSocket *client_sock)
  	port->sock = client_sock->sock;
  	memcpy(&port->raddr.addr, &client_sock->raddr.addr, client_sock->raddr.salen);
  	port->raddr.salen = client_sock->raddr.salen;
@@ -5347,7 +5387,7 @@ index daa06961..ff5277a6 100644
  	/* fill in the server (local) address */
  	port->laddr.salen = sizeof(port->laddr.addr);
  	if (getsockname(port->sock,
-@@ -273,6 +288,7 @@ pq_init(ClientSocket *client_sock)
+@@ -274,6 +289,7 @@ pq_init(ClientSocket *client_sock)
  		(void) pq_setkeepalivescount(tcp_keepalives_count, port);
  		(void) pq_settcpusertimeout(tcp_user_timeout, port);
  	}
@@ -5355,7 +5395,7 @@ index daa06961..ff5277a6 100644
  
  	/* initialize state variables */
  	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
-@@ -280,7 +296,7 @@ pq_init(ClientSocket *client_sock)
+@@ -281,7 +297,7 @@ pq_init(ClientSocket *client_sock)
  	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
  	PqCommBusy = false;
  	PqCommReadingMsg = false;
@@ -5364,7 +5404,7 @@ index daa06961..ff5277a6 100644
  	/* set up process-exit hook to close the socket */
  	on_proc_exit(socket_close, 0);
  
-@@ -310,7 +326,10 @@ pq_init(ClientSocket *client_sock)
+@@ -311,7 +327,10 @@ pq_init(ClientSocket *client_sock)
  								  MyLatch, NULL);
  	AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET,
  					  NULL, NULL);
@@ -5376,7 +5416,7 @@ index daa06961..ff5277a6 100644
  	/*
  	 * The event positions match the order we added them, but let's sanity
  	 * check them to be sure.
-@@ -730,7 +749,7 @@ Setup_AF_UNIX(const char *sock_path)
+@@ -731,7 +750,7 @@ Setup_AF_UNIX(const char *sock_path)
  	Assert(Unix_socket_group);
  	if (Unix_socket_group[0] != '\0')
  	{
@@ -5385,7 +5425,7 @@ index daa06961..ff5277a6 100644
  		elog(WARNING, "configuration item \"unix_socket_group\" is not supported on this platform");
  #else
  		char	   *endptr;
-@@ -909,6 +928,20 @@ pq_recvbuf(void)
+@@ -910,6 +929,20 @@ pq_recvbuf(void)
  		else
  			PqRecvLength = PqRecvPointer = 0;
  	}
@@ -5406,7 +5446,7 @@ index daa06961..ff5277a6 100644
  
  	/* Ensure that we're in blocking mode */
  	socket_set_nonblocking(false);
-@@ -1011,7 +1044,9 @@ pq_getbyte_if_available(unsigned char *c)
+@@ -1012,7 +1045,9 @@ pq_getbyte_if_available(unsigned char *c)
  		*c = PqRecvBuffer[PqRecvPointer++];
  		return 1;
  	}
@@ -5417,7 +5457,7 @@ index daa06961..ff5277a6 100644
  	/* Put the socket into non-blocking mode */
  	socket_set_nonblocking(true);
  
-@@ -1048,7 +1083,7 @@ pq_getbyte_if_available(unsigned char *c)
+@@ -1049,7 +1084,7 @@ pq_getbyte_if_available(unsigned char *c)
  		/* EOF detected */
  		r = EOF;
  	}
@@ -5426,7 +5466,7 @@ index daa06961..ff5277a6 100644
  	return r;
  }
  
-@@ -1115,6 +1150,7 @@ pq_discardbytes(size_t len)
+@@ -1117,6 +1152,7 @@ pq_discardbytes(size_t len)
  	return 0;
  }
  
@@ -5434,7 +5474,7 @@ index daa06961..ff5277a6 100644
  /* --------------------------------
   *		pq_buffer_remaining_data	- return number of bytes in receive buffer
   *
-@@ -1136,6 +1172,26 @@ pq_buffer_remaining_data(void)
+@@ -1138,6 +1174,26 @@ pq_buffer_remaining_data(void)
   *		This must be called before any of the pq_get* functions.
   * --------------------------------
   */
@@ -5461,7 +5501,7 @@ index daa06961..ff5277a6 100644
  void
  pq_startmsgread(void)
  {
-@@ -1147,7 +1203,29 @@ pq_startmsgread(void)
+@@ -1149,7 +1205,29 @@ pq_startmsgread(void)
  		ereport(FATAL,
  				(errcode(ERRCODE_PROTOCOL_VIOLATION),
  				 errmsg("terminating connection because protocol synchronization was lost")));
@@ -5491,7 +5531,7 @@ index daa06961..ff5277a6 100644
  	PqCommReadingMsg = true;
  }
  
-@@ -1270,7 +1348,56 @@ pq_getmessage(StringInfo s, int maxlen)
+@@ -1272,7 +1350,56 @@ pq_getmessage(StringInfo s, int maxlen)
  
  	return 0;
  }
@@ -5547,8 +5587,8 @@ index daa06961..ff5277a6 100644
 +#else
  
  static inline int
- internal_putbytes(const char *s, size_t len)
-@@ -1421,7 +1548,7 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
+ internal_putbytes(const void *b, size_t len)
+@@ -1425,7 +1552,7 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
  	*start = *end = 0;
  	return 0;
  }
@@ -5558,10 +5598,10 @@ index daa06961..ff5277a6 100644
   *		pq_flush_if_writable - flush pending output if writable without blocking
   *
 diff --git a/src/backend/port/posix_sema.c b/src/backend/port/posix_sema.c
-index 5886d223..f7d5e2b2 100644
+index 269c746..047a0c5 100644
 --- a/src/backend/port/posix_sema.c
 +++ b/src/backend/port/posix_sema.c
-@@ -298,10 +298,16 @@ PGSemaphoreReset(PGSemaphore sema)
+@@ -297,10 +297,16 @@ PGSemaphoreReset(PGSemaphore sema)
  	 * There's no direct API for this in POSIX, so we have to ratchet the
  	 * semaphore down to 0 with repeated trywait's.
  	 */
@@ -5578,7 +5618,7 @@ index 5886d223..f7d5e2b2 100644
  			if (errno == EAGAIN || errno == EDEADLK)
  				break;			/* got it down to 0 */
  			if (errno == EINTR)
-@@ -309,6 +315,7 @@ PGSemaphoreReset(PGSemaphore sema)
+@@ -308,6 +314,7 @@ PGSemaphoreReset(PGSemaphore sema)
  			elog(FATAL, "sem_trywait failed: %m");
  		}
  	}
@@ -5587,7 +5627,7 @@ index 5886d223..f7d5e2b2 100644
  
  /*
 diff --git a/src/backend/port/sysv_shmem.c b/src/backend/port/sysv_shmem.c
-index 362a37d3..c11f963a 100644
+index 197926d..57bb46f 100644
 --- a/src/backend/port/sysv_shmem.c
 +++ b/src/backend/port/sysv_shmem.c
 @@ -17,8 +17,8 @@
@@ -5651,10 +5691,10 @@ index 362a37d3..c11f963a 100644
  	 * We use the data directory's ID info (inode and device numbers) to
  	 * positively identify shmem segments associated with this data dir, and
 diff --git a/src/backend/postmaster/checkpointer.c b/src/backend/postmaster/checkpointer.c
-index 342376f9..b7f9923e 100644
+index 3914ac8..2bc0470 100644
 --- a/src/backend/postmaster/checkpointer.c
 +++ b/src/backend/postmaster/checkpointer.c
-@@ -953,7 +953,9 @@ RequestCheckpoint(int flags)
+@@ -1009,7 +1009,9 @@ RequestCheckpoint(int flags)
  	/*
  	 * If in a standalone backend, just do it ourselves.
  	 */
@@ -5665,10 +5705,10 @@ index 342376f9..b7f9923e 100644
  		/*
  		 * There's no point in doing slow checkpoints in a standalone backend,
 diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
-index db451294..29f42778 100644
+index 5124d39..e63d97e 100644
 --- a/src/backend/postmaster/postmaster.c
 +++ b/src/backend/postmaster/postmaster.c
-@@ -1442,7 +1442,7 @@ getInstallationPaths(const char *argv0)
+@@ -1466,7 +1466,7 @@ getInstallationPaths(const char *argv0)
  	/* Locate the postgres executable itself */
  	if (find_my_exec(argv0, my_exec_path) < 0)
  		ereport(FATAL,
@@ -5678,7 +5718,7 @@ index db451294..29f42778 100644
  #ifdef EXEC_BACKEND
  	/* Locate executable backend before we change working directory */
 diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
-index 6aa6bae5..a001309f 100644
+index 378c078..b83ffeb 100644
 --- a/src/backend/storage/file/fd.c
 +++ b/src/backend/storage/file/fd.c
 @@ -69,7 +69,7 @@
@@ -5728,7 +5768,17 @@ index 6aa6bae5..a001309f 100644
  	if (ret == -1 && errno == EINTR)
  		goto retry;
  #endif
-@@ -2672,7 +2678,7 @@ OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+@@ -1043,6 +1049,9 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
+ void
+ set_max_safe_fds(void)
+ {
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++	return;
++#endif
+ 	int			usable_fds;
+ 	int			already_open;
+ 
+@@ -2733,7 +2742,7 @@ OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
  
  	return -1;					/* failure */
  }
@@ -5737,7 +5787,7 @@ index 6aa6bae5..a001309f 100644
  /*
   * Routines that want to initiate a pipe stream should use OpenPipeStream
   * rather than plain popen().  This lets fd.c deal with freeing FDs if
-@@ -2732,7 +2738,7 @@ TryAgain:
+@@ -2793,7 +2799,7 @@ TryAgain:
  
  	return NULL;
  }
@@ -5747,7 +5797,7 @@ index 6aa6bae5..a001309f 100644
   * Free an AllocateDesc of any type.
   *
 diff --git a/src/backend/storage/ipc/ipc.c b/src/backend/storage/ipc/ipc.c
-index 7c761c52..9963619c 100644
+index 0684d34..0f8a283 100644
 --- a/src/backend/storage/ipc/ipc.c
 +++ b/src/backend/storage/ipc/ipc.c
 @@ -104,6 +104,48 @@ static int	on_proc_exit_index,
@@ -5770,7 +5820,7 @@ index 7c761c52..9963619c 100644
 +		shmem_exit_inprogress = true;
 +		int save_before_shmem_exit_index = before_shmem_exit_index;
 +		while (--before_shmem_exit_index >= 0) {
-+			if (before_shmem_exit_index!=4) {
++			if (before_shmem_exit_index!=5) {
 +				printf("# skipped shmem_exit_index=%d/%d\n", before_shmem_exit_index, save_before_shmem_exit_index);
 +				continue;
 +			} else
@@ -5843,33 +5893,13 @@ index 7c761c52..9963619c 100644
  	if (on_shmem_exit_index >= MAX_ON_EXITS)
  		ereport(FATAL,
  				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-diff --git a/src/backend/storage/ipc/latch.c b/src/backend/storage/ipc/latch.c
-index 2b4ded38..aeeab454 100644
---- a/src/backend/storage/ipc/latch.c
-+++ b/src/backend/storage/ipc/latch.c
-@@ -231,6 +231,7 @@ ResourceOwnerForgetWaitEventSet(ResourceOwner owner, WaitEventSet *set)
- void
- InitializeLatchSupport(void)
- {
-+#if !defined(__wasi__)
- #if defined(WAIT_USE_SELF_PIPE)
- 	int			pipefd[2];
- 
-@@ -340,6 +341,7 @@ InitializeLatchSupport(void)
- 	/* Ignore SIGURG, because we'll receive it via kqueue. */
- 	pqsignal(SIGURG, SIG_IGN);
- #endif
-+#endif /* __wasi__ */
- }
- 
- void
 diff --git a/src/backend/storage/ipc/procsignal.c b/src/backend/storage/ipc/procsignal.c
-index 50b3cb2f..4b5fc0fc 100644
+index e7c9da2..1b3bf1c 100644
 --- a/src/backend/storage/ipc/procsignal.c
 +++ b/src/backend/storage/ipc/procsignal.c
-@@ -424,6 +424,9 @@ WaitForProcSignalBarrier(uint64 generation)
+@@ -460,6 +460,9 @@ WaitForProcSignalBarrier(uint64 generation)
  						(errmsg("still waiting for backend with PID %d to accept ProcSignalBarrier",
- 								(int) slot->pss_pid)));
+ 								(int) pg_atomic_read_u32(&slot->pss_pid))));
  			oldval = pg_atomic_read_u64(&slot->pss_barrierGeneration);
 +#if defined(__EMSCRIPTEN__) || defined(__wasi__)
 +            break;
@@ -5878,10 +5908,10 @@ index 50b3cb2f..4b5fc0fc 100644
  		ConditionVariableCancelSleep();
  	}
 diff --git a/src/backend/storage/ipc/signalfuncs.c b/src/backend/storage/ipc/signalfuncs.c
-index 88e9bf81..2db7ccfa 100644
+index a3a670b..9ae3648 100644
 --- a/src/backend/storage/ipc/signalfuncs.c
 +++ b/src/backend/storage/ipc/signalfuncs.c
-@@ -98,7 +98,12 @@ pg_signal_backend(int pid, int sig)
+@@ -112,7 +112,12 @@ pg_signal_backend(int pid, int sig)
  	 */
  
  	/* If we have setsid(), signal the backend's whole process group */
@@ -5895,7 +5925,7 @@ index 88e9bf81..2db7ccfa 100644
  	if (kill(-pid, sig))
  #else
  	if (kill(pid, sig))
-@@ -106,7 +111,7 @@ pg_signal_backend(int pid, int sig)
+@@ -120,7 +125,7 @@ pg_signal_backend(int pid, int sig)
  	{
  		/* Again, just a warning to allow loops */
  		ereport(WARNING,
@@ -5905,7 +5935,7 @@ index 88e9bf81..2db7ccfa 100644
  	}
  	return SIGNAL_BACKEND_SUCCESS;
 diff --git a/src/backend/storage/ipc/sinvaladt.c b/src/backend/storage/ipc/sinvaladt.c
-index 27121298..396d4912 100644
+index c5748b6..65469dd 100644
 --- a/src/backend/storage/ipc/sinvaladt.c
 +++ b/src/backend/storage/ipc/sinvaladt.c
 @@ -288,17 +288,21 @@ SharedInvalBackendInit(bool sendOnly)
@@ -5933,11 +5963,31 @@ index 27121298..396d4912 100644
  	/* Fetch next local transaction ID into local memory */
  	nextLocalTransactionId = stateP->nextLXID;
  
+diff --git a/src/backend/storage/ipc/waiteventset.c b/src/backend/storage/ipc/waiteventset.c
+index b074652..6569a08 100644
+--- a/src/backend/storage/ipc/waiteventset.c
++++ b/src/backend/storage/ipc/waiteventset.c
+@@ -240,6 +240,7 @@ ResourceOwnerForgetWaitEventSet(ResourceOwner owner, WaitEventSet *set)
+ void
+ InitializeWaitEventSupport(void)
+ {
++#if !defined(__wasi__)
+ #if defined(WAIT_USE_SELF_PIPE)
+ 	int			pipefd[2];
+ 
+@@ -349,6 +350,7 @@ InitializeWaitEventSupport(void)
+ 	/* Ignore SIGURG, because we'll receive it via kqueue. */
+ 	pqsignal(SIGURG, SIG_IGN);
+ #endif
++#endif /* __wasi__ */
+ }
+ 
+ /*
 diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
-index d204fa1d..4e0602db 100644
+index b59e38a..2647449 100644
 --- a/src/backend/storage/lmgr/proc.c
 +++ b/src/backend/storage/lmgr/proc.c
-@@ -307,7 +307,11 @@ InitProcess(void)
+@@ -399,7 +399,11 @@ InitProcess(void)
  		elog(PANIC, "proc header uninitialized");
  
  	if (MyProc != NULL)
@@ -5949,21 +5999,21 @@ index d204fa1d..4e0602db 100644
 +#endif
  
  	/*
- 	 * Decide which list should supply our PGPROC.  This logic must match the
-@@ -538,7 +542,7 @@ InitAuxiliaryProcess(void)
+ 	 * Before we start accessing the shared memory in a serious way, mark
+@@ -625,7 +629,7 @@ InitAuxiliaryProcess(void)
  		elog(PANIC, "proc header uninitialized");
  
  	if (MyProc != NULL)
 -		elog(ERROR, "you already exist");
 +		elog(ERROR, "# 522: you already exist");
  
- 	/*
- 	 * We use the ProcStructLock to protect assignment and releasing of
+ 	if (IsUnderPostmaster)
+ 		RegisterPostmasterChildActive();
 diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
-index 696fd185..207560e2 100644
+index 115a634..ec245cd 100644
 --- a/src/backend/tcop/postgres.c
 +++ b/src/backend/tcop/postgres.c
-@@ -108,6 +108,19 @@ int			client_connection_check_interval = 0;
+@@ -105,6 +105,19 @@ int			client_connection_check_interval = 0;
  /* flags for non-system relation kinds to restrict use */
  int			restrict_nonsystem_relation_kind;
  
@@ -5983,7 +6033,7 @@ index 696fd185..207560e2 100644
  /* ----------------
   *		private typedefs etc
   * ----------------
-@@ -4135,7 +4148,7 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
+@@ -4045,7 +4058,7 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
  #endif
  }
  
@@ -5992,7 +6042,7 @@ index 696fd185..207560e2 100644
  /*
   * PostgresSingleUserMain
   *     Entry point for single user mode. argc/argv are the command line
-@@ -5034,7 +5047,7 @@ PostgresMain(const char *dbname, const char *username)
+@@ -5024,7 +5037,7 @@ PostgresMain(const char *dbname, const char *username)
  		}
  	}							/* end of input-reading loop */
  }
@@ -6001,7 +6051,7 @@ index 696fd185..207560e2 100644
  /*
   * Throw an error if we're a WAL sender process.
   *
-@@ -5153,8 +5166,9 @@ ShowUsage(const char *title)
+@@ -5109,8 +5122,9 @@ ShowUsage(const char *title)
  					 (long) user.tv_usec,
  					 (long) sys.tv_sec,
  					 (long) sys.tv_usec);
@@ -6012,7 +6062,7 @@ index 696fd185..207560e2 100644
  	/*
  	 * The following rusage fields are not defined by POSIX, but they're
  	 * present on all current Unix-like systems so we use them without any
-@@ -5196,8 +5210,9 @@ ShowUsage(const char *title)
+@@ -5152,8 +5166,9 @@ ShowUsage(const char *title)
  					 r.ru_nvcsw - Save_r.ru_nvcsw,
  					 r.ru_nivcsw - Save_r.ru_nivcsw,
  					 r.ru_nvcsw, r.ru_nivcsw);
@@ -6024,10 +6074,10 @@ index 696fd185..207560e2 100644
  	if (str.data[str.len - 1] == '\n')
  		str.data[--str.len] = '\0';
 diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
-index 29ef8bea..7aa48214 100644
+index 6dabd7e..c8af30e 100644
 --- a/src/backend/tcop/utility.c
 +++ b/src/backend/tcop/utility.c
-@@ -804,7 +804,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+@@ -807,7 +807,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
  				ListenStmt *stmt = (ListenStmt *) parsetree;
  
  				CheckRestrictedOperation("LISTEN");
@@ -6036,7 +6086,7 @@ index 29ef8bea..7aa48214 100644
  				/*
  				 * We don't allow LISTEN in background processes, as there is
  				 * no mechanism for them to collect NOTIFY messages, so they'd
-@@ -820,7 +820,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+@@ -823,7 +823,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
  					/* translator: %s is name of a SQL command, eg LISTEN */
  							 errmsg("cannot execute %s within a background process",
  									"LISTEN")));
@@ -6046,10 +6096,10 @@ index 29ef8bea..7aa48214 100644
  			}
  			break;
 diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
-index 929d59ac..bb6e4835 100644
+index 507fa69..3865301 100644
 --- a/src/backend/utils/adt/ruleutils.c
 +++ b/src/backend/utils/adt/ruleutils.c
-@@ -321,8 +321,9 @@ static SPIPlanPtr plan_getviewrule = NULL;
+@@ -336,8 +336,9 @@ static SPIPlanPtr plan_getviewrule = NULL;
  static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrite WHERE ev_class = $1 AND rulename = $2";
  
  /* GUC parameters */
@@ -6061,10 +6111,10 @@ index 929d59ac..bb6e4835 100644
  /* ----------
   * Local functions
 diff --git a/src/backend/utils/error/elog.c b/src/backend/utils/error/elog.c
-index 4f66acc5..31e77cdf 100644
+index d78f3ab..efd23bf 100644
 --- a/src/backend/utils/error/elog.c
 +++ b/src/backend/utils/error/elog.c
-@@ -348,12 +348,16 @@ errstart(int elevel, const char *domain)
+@@ -345,12 +345,16 @@ errstart(int elevel, const char *domain)
  	ErrorData  *edata;
  	bool		output_to_server;
  	bool		output_to_client = false;
@@ -6081,7 +6131,7 @@ index 4f66acc5..31e77cdf 100644
  	if (elevel >= ERROR)
  	{
  		/*
-@@ -394,7 +398,7 @@ errstart(int elevel, const char *domain)
+@@ -391,7 +395,7 @@ errstart(int elevel, const char *domain)
  		for (i = 0; i <= errordata_stack_depth; i++)
  			elevel = Max(elevel, errordata[i].elevel);
  	}
@@ -6090,7 +6140,7 @@ index 4f66acc5..31e77cdf 100644
  	/*
  	 * Now decide whether we need to process this report at all; if it's
  	 * warning or less and not enabled for logging, just return false without
-@@ -539,7 +543,12 @@ errfinish(const char *filename, int lineno, const char *funcname)
+@@ -536,7 +540,12 @@ errfinish(const char *filename, int lineno, const char *funcname)
  		 */
  
  		recursion_depth--;
@@ -6103,7 +6153,7 @@ index 4f66acc5..31e77cdf 100644
  	}
  
  	/* Emit the message to the right places */
-@@ -587,7 +596,11 @@ errfinish(const char *filename, int lineno, const char *funcname)
+@@ -584,7 +593,11 @@ errfinish(const char *filename, int lineno, const char *funcname)
  		 * FATAL termination.  The postmaster may or may not consider this
  		 * worthy of panic, depending on which subprocess returns it.
  		 */
@@ -6115,7 +6165,7 @@ index 4f66acc5..31e77cdf 100644
  	}
  
  	if (elevel >= PANIC)
-@@ -697,6 +710,7 @@ errsave_finish(struct Node *context, const char *filename, int lineno,
+@@ -694,6 +707,7 @@ errsave_finish(struct Node *context, const char *filename, int lineno,
  	 */
  	if (edata->elevel >= ERROR)
  	{
@@ -6124,10 +6174,10 @@ index 4f66acc5..31e77cdf 100644
  		pg_unreachable();
  	}
 diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c
-index 092004dc..55c606dc 100644
+index 1366521..6ee239f 100644
 --- a/src/backend/utils/fmgr/dfmgr.c
 +++ b/src/backend/utils/fmgr/dfmgr.c
-@@ -121,12 +121,15 @@ load_external_function(const char *filename, const char *funcname,
+@@ -126,12 +126,15 @@ load_external_function(const char *filename, const char *funcname,
  
  	/* Look up the function within the library. */
  	retval = dlsym(lib_handle, funcname);
@@ -6145,10 +6195,10 @@ index 092004dc..55c606dc 100644
  	pfree(fullname);
  	return retval;
 diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
-index 0d06f0bd..199c4dc5 100644
+index df18257..ea32637 100644
 --- a/src/backend/utils/init/miscinit.c
 +++ b/src/backend/utils/init/miscinit.c
-@@ -144,7 +144,7 @@ InitPostmasterChild(void)
+@@ -137,7 +137,7 @@ InitPostmasterChild(void)
  	 * children, but for consistency we make all postmaster child processes do
  	 * this.
  	 */
@@ -6157,7 +6207,7 @@ index 0d06f0bd..199c4dc5 100644
  	if (setsid() < 0)
  		elog(FATAL, "setsid() failed: %m");
  #endif
-@@ -210,7 +210,7 @@ InitStandaloneProcess(const char *argv0)
+@@ -203,7 +203,7 @@ InitStandaloneProcess(const char *argv0)
  	if (my_exec_path[0] == '\0')
  	{
  		if (find_my_exec(argv0, my_exec_path) < 0)
@@ -6166,7 +6216,7 @@ index 0d06f0bd..199c4dc5 100644
  				 argv0);
  	}
  
-@@ -375,7 +375,7 @@ checkDataDir(void)
+@@ -380,7 +380,7 @@ checkDataDir(void)
  	 *
  	 * XXX can we safely enable this check on Windows?
  	 */
@@ -6175,7 +6225,7 @@ index 0d06f0bd..199c4dc5 100644
  	if (stat_buf.st_uid != geteuid())
  		ereport(FATAL,
  				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-@@ -395,7 +395,7 @@ checkDataDir(void)
+@@ -400,7 +400,7 @@ checkDataDir(void)
  	 * be proper support for Unix-y file permissions.  Need to think of a
  	 * reasonable check to apply on Windows.
  	 */
@@ -6184,7 +6234,7 @@ index 0d06f0bd..199c4dc5 100644
  	if (stat_buf.st_mode & PG_MODE_MASK_GROUP)
  		ereport(FATAL,
  				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-@@ -416,7 +416,7 @@ checkDataDir(void)
+@@ -421,7 +421,7 @@ checkDataDir(void)
  	 * Suppress when on Windows, because there may not be proper support for
  	 * Unix-y file permissions.
  	 */
@@ -6193,7 +6243,7 @@ index 0d06f0bd..199c4dc5 100644
  	SetDataDirectoryCreatePerm(stat_buf.st_mode);
  
  	umask(pg_mode_mask);
-@@ -1267,7 +1267,13 @@ CreateLockFile(const char *filename, bool amPostmaster,
+@@ -1272,7 +1272,13 @@ CreateLockFile(const char *filename, bool amPostmaster,
  		 * Think not to make the file protection weaker than 0600/0640.  See
  		 * comments below.
  		 */
@@ -6208,7 +6258,7 @@ index 0d06f0bd..199c4dc5 100644
  			break;				/* Success; exit the retry loop */
  
 diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
-index 2ed7c7c0..dc94e69b 100644
+index c86ceef..6818ad5 100644
 --- a/src/backend/utils/init/postinit.c
 +++ b/src/backend/utils/init/postinit.c
 @@ -13,6 +13,7 @@
@@ -6219,7 +6269,7 @@ index 2ed7c7c0..dc94e69b 100644
  #include "postgres.h"
  
  #include <ctype.h>
-@@ -734,6 +735,7 @@ BaseInit(void)
+@@ -708,6 +709,7 @@ BaseInit(void)
   *		Be very careful with the order of calls in the InitPostgres function.
   * --------------------------------
   */
@@ -6227,11 +6277,10 @@ index 2ed7c7c0..dc94e69b 100644
  void
  InitPostgres(const char *in_dbname, Oid dboid,
  			 const char *username, Oid useroid,
-@@ -754,15 +756,15 @@ InitPostgres(const char *in_dbname, Oid dboid,
- 	 * Once I have done this, I am visible to other backends!
- 	 */
- 	InitProcessPhase2();
--
+@@ -743,14 +745,15 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 		INJECTION_POINT("init-pre-auth", NULL);
+ 	}
+ 
 +puts("# 758:"__FILE__);
  	/*
  	 * Initialize my entry in the shared-invalidation manager's array of
@@ -6240,13 +6289,13 @@ index 2ed7c7c0..dc94e69b 100644
  	SharedInvalBackendInit(false);
 -
 +puts("# 764:"__FILE__);
- 	ProcSignalInit();
+ 	ProcSignalInit(MyCancelKey, MyCancelKeyLength);
 -
 +puts("# 766:"__FILE__);
  	/*
  	 * Also set up timeout handlers needed for backend operation.  We need
  	 * these in every case except bootstrap.
-@@ -896,8 +898,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
+@@ -870,8 +873,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
  	}
  	else if (!IsUnderPostmaster)
  	{
@@ -6265,7 +6314,7 @@ index 2ed7c7c0..dc94e69b 100644
  		if (!ThereIsAtLeastOneRole())
  			ereport(WARNING,
  					(errcode(ERRCODE_UNDEFINED_OBJECT),
-@@ -1254,6 +1266,32 @@ InitPostgres(const char *in_dbname, Oid dboid,
+@@ -1236,6 +1249,32 @@ InitPostgres(const char *in_dbname, Oid dboid,
  		CommitTransactionCommand();
  }
  
@@ -6298,7 +6347,7 @@ index 2ed7c7c0..dc94e69b 100644
  /*
   * Process any command-line switches and any additional GUC variable
   * settings passed in the startup packet.
-@@ -1360,14 +1398,15 @@ process_settings(Oid databaseid, Oid roleid)
+@@ -1342,14 +1381,15 @@ process_settings(Oid databaseid, Oid roleid)
  static void
  ShutdownPostgres(int code, Datum arg)
  {
@@ -6316,10 +6365,10 @@ index 2ed7c7c0..dc94e69b 100644
  
  
 diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
-index 29a89722..0b95cc43 100644
+index ce5449f..70486bb 100644
 --- a/src/backend/utils/misc/guc.c
 +++ b/src/backend/utils/misc/guc.c
-@@ -1861,7 +1861,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+@@ -1859,7 +1859,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
  	 * data_directory parameter is picked up to determine the data directory,
  	 * so that we can read the PG_AUTOCONF_FILENAME file next time.
  	 */
@@ -6328,7 +6377,7 @@ index 29a89722..0b95cc43 100644
  
  	/*
  	 * If the data_directory GUC variable has been set, use that as DataDir;
-@@ -1902,7 +1902,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+@@ -1900,7 +1900,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
  	 * since we have to determine the DataDir before we can find the autoconf
  	 * file, the alternatives seem worse.)
  	 */
@@ -6338,7 +6387,7 @@ index 29a89722..0b95cc43 100644
  	/*
  	 * If timezone_abbreviations wasn't set in the configuration file, install
 diff --git a/src/backend/utils/misc/timeout.c b/src/backend/utils/misc/timeout.c
-index ec7e5709..980a7de8 100644
+index d92efa1..01969e9 100644
 --- a/src/backend/utils/misc/timeout.c
 +++ b/src/backend/utils/misc/timeout.c
 @@ -110,10 +110,20 @@ find_active_timeout(TimeoutId id)
@@ -6390,10 +6439,10 @@ index ec7e5709..980a7de8 100644
  
  
 diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
-index 4e613326..c5851659 100644
+index f1a6db1..e984bc1 100644
 --- a/src/bin/initdb/initdb.c
 +++ b/src/bin/initdb/initdb.c
-@@ -171,7 +171,11 @@ static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
+@@ -172,7 +172,11 @@ static bool sync_data_files = true;
  
  
  /* internal vars */
@@ -6405,7 +6454,7 @@ index 4e613326..c5851659 100644
  static int	encodingid;
  static char *bki_file;
  static char *hba_file;
-@@ -811,6 +815,7 @@ cleanup_directories_atexit(void)
+@@ -814,6 +818,7 @@ cleanup_directories_atexit(void)
  static char *
  get_id(void)
  {
@@ -6413,7 +6462,7 @@ index 4e613326..c5851659 100644
  	const char *username;
  
  #ifndef WIN32
-@@ -825,6 +830,10 @@ get_id(void)
+@@ -828,6 +833,10 @@ get_id(void)
  	username = get_user_name_or_exit(progname);
  
  	return pg_strdup(username);
@@ -6424,7 +6473,7 @@ index 4e613326..c5851659 100644
  }
  
  static char *
-@@ -1070,6 +1079,9 @@ set_null_conf(void)
+@@ -1075,6 +1084,9 @@ set_null_conf(void)
  static const char *
  choose_dsm_implementation(void)
  {
@@ -6434,7 +6483,7 @@ index 4e613326..c5851659 100644
  #if defined(HAVE_SHM_OPEN) && !defined(__sun__)
  	int			ntries = 10;
  	pg_prng_state prng_state;
-@@ -1608,10 +1620,8 @@ bootstrap_template1(void)
+@@ -1626,10 +1638,8 @@ bootstrap_template1(void)
  	}
  
  	PG_CMD_CLOSE();
@@ -6446,7 +6495,7 @@ index 4e613326..c5851659 100644
  	check_ok();
  }
  
-@@ -1711,16 +1721,16 @@ static void
+@@ -1729,16 +1739,16 @@ static void
  setup_run_file(FILE *cmdfd, const char *filename)
  {
  	char	  **lines;
@@ -6466,7 +6515,7 @@ index 4e613326..c5851659 100644
  
  	free(lines);
  }
-@@ -2636,8 +2646,13 @@ setup_bin_paths(const char *argv0)
+@@ -2658,8 +2668,13 @@ setup_bin_paths(const char *argv0)
  			strlcpy(full_path, progname, sizeof(full_path));
  
  		if (ret == -1)
@@ -6480,7 +6529,7 @@ index 4e613326..c5851659 100644
  		else
  			pg_fatal("program \"%s\" was found by \"%s\" but was not the same version as %s",
  					 "postgres", full_path, progname);
-@@ -3138,10 +3153,49 @@ initialize_data_directory(void)
+@@ -3153,10 +3168,49 @@ initialize_data_directory(void)
  	check_ok();
  }
  
@@ -6532,7 +6581,7 @@ index 4e613326..c5851659 100644
  	static struct option long_options[] = {
  		{"pgdata", required_argument, NULL, 'D'},
  		{"encoding", required_argument, NULL, 'E'},
-@@ -3201,9 +3255,15 @@ main(int argc, char *argv[])
+@@ -3218,9 +3272,15 @@ main(int argc, char *argv[])
  	 * POSIX says we must do this before any other usage of these files.
  	 */
  	setvbuf(stdout, NULL, PG_IOLBF, 0);
@@ -6549,7 +6598,7 @@ index 4e613326..c5851659 100644
  	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("initdb"));
  
  	if (argc > 1)
-@@ -3409,7 +3469,10 @@ main(int argc, char *argv[])
+@@ -3432,7 +3492,10 @@ main(int argc, char *argv[])
  	if (icu_rules && locale_provider != COLLPROVIDER_ICU)
  		pg_fatal("%s cannot be specified unless locale provider \"%s\" is chosen",
  				 "--icu-rules", "icu");
@@ -6561,7 +6610,7 @@ index 4e613326..c5851659 100644
  	atexit(cleanup_directories_atexit);
  
  	/* If we only need to sync, just do it and exit */
-@@ -3445,9 +3508,7 @@ main(int argc, char *argv[])
+@@ -3468,9 +3531,7 @@ main(int argc, char *argv[])
  	get_restricted_token();
  
  	setup_pgdata();
@@ -6571,7 +6620,7 @@ index 4e613326..c5851659 100644
  	effective_user = get_id();
  	if (!username)
  		username = effective_user;
-@@ -3479,7 +3540,7 @@ main(int argc, char *argv[])
+@@ -3502,7 +3563,7 @@ main(int argc, char *argv[])
  		get_su_pwd();
  
  	printf("\n");
@@ -6580,7 +6629,7 @@ index 4e613326..c5851659 100644
  	initialize_data_directory();
  
  	if (do_sync)
-@@ -3535,7 +3596,6 @@ main(int argc, char *argv[])
+@@ -3558,7 +3619,6 @@ main(int argc, char *argv[])
  		destroyPQExpBuffer(start_db_cmd);
  	}
  
@@ -6589,10 +6638,10 @@ index 4e613326..c5851659 100644
  	return 0;
  }
 diff --git a/src/bin/pg_config/pg_config.c b/src/bin/pg_config/pg_config.c
-index 77d09ccf..1fc3e629 100644
+index 28db024..6c84c8c 100644
 --- a/src/bin/pg_config/pg_config.c
 +++ b/src/bin/pg_config/pg_config.c
-@@ -152,7 +152,9 @@ main(int argc, char **argv)
+@@ -151,7 +151,9 @@ main(int argc, char **argv)
  	if (find_my_exec(argv[0], my_exec_path) < 0)
  	{
  		fprintf(stderr, _("%s: could not find own program executable\n"), progname);
@@ -6602,7 +6651,7 @@ index 77d09ccf..1fc3e629 100644
  	}
  
  	configdata = get_configdata(my_exec_path, &configdata_len);
-@@ -162,6 +164,7 @@ main(int argc, char **argv)
+@@ -161,6 +163,7 @@ main(int argc, char **argv)
  		for (i = 0; i < configdata_len; i++)
  			printf("%s = %s\n", configdata[i].name, configdata[i].setting);
  		exit(0);
@@ -6611,10 +6660,10 @@ index 77d09ccf..1fc3e629 100644
  
  	/* otherwise print requested items */
 diff --git a/src/bin/pg_ctl/pg_ctl.c b/src/bin/pg_ctl/pg_ctl.c
-index ed97eb3f..ab34be3f 100644
+index 8a405ff..b77b526 100644
 --- a/src/bin/pg_ctl/pg_ctl.c
 +++ b/src/bin/pg_ctl/pg_ctl.c
-@@ -154,6 +154,16 @@ static bool wait_for_postmaster_stop(void);
+@@ -155,6 +155,16 @@ static bool wait_for_postmaster_stop(void);
  static bool wait_for_postmaster_promote(void);
  static bool postmaster_is_alive(pid_t pid);
  
@@ -6631,7 +6680,7 @@ index ed97eb3f..ab34be3f 100644
  #if defined(HAVE_GETRLIMIT)
  static void unlimit_core_size(void);
  #endif
-@@ -492,9 +502,9 @@ start_postmaster(void)
+@@ -493,9 +503,9 @@ start_postmaster(void)
  	else
  		cmd = psprintf("exec \"%s\" %s%s < \"%s\" 2>&1",
  					   exec_path, pgdata_opt, post_opts, DEVNULL);
@@ -6644,7 +6693,7 @@ index ed97eb3f..ab34be3f 100644
  	write_stderr(_("%s: could not start server: %m\n"),
  				 progname);
 diff --git a/src/bin/pg_dump/parallel.c b/src/bin/pg_dump/parallel.c
-index f8680474..b4170fc8 100644
+index 8f57b62..1d635cd 100644
 --- a/src/bin/pg_dump/parallel.c
 +++ b/src/bin/pg_dump/parallel.c
 @@ -49,7 +49,7 @@
@@ -6656,7 +6705,7 @@ index f8680474..b4170fc8 100644
  #include "postgres_fe.h"
  
  #ifndef WIN32
-@@ -445,6 +445,7 @@ ShutdownWorkersHard(ParallelState *pstate)
+@@ -447,6 +447,7 @@ ShutdownWorkersHard(ParallelState *pstate)
  static void
  WaitForTerminatingWorkers(ParallelState *pstate)
  {
@@ -6664,7 +6713,7 @@ index f8680474..b4170fc8 100644
  	while (!HasEveryWorkerTerminated(pstate))
  	{
  		ParallelSlot *slot = NULL;
-@@ -504,6 +505,7 @@ WaitForTerminatingWorkers(ParallelState *pstate)
+@@ -506,6 +507,7 @@ WaitForTerminatingWorkers(ParallelState *pstate)
  		slot->workerStatus = WRKR_TERMINATED;
  		pstate->te[j] = NULL;
  	}
@@ -6673,10 +6722,10 @@ index f8680474..b4170fc8 100644
  
  
 diff --git a/src/bin/pg_dump/pg_backup_db.c b/src/bin/pg_dump/pg_backup_db.c
-index a02841c4..f57d971a 100644
+index 5c34927..5732f53 100644
 --- a/src/bin/pg_dump/pg_backup_db.c
 +++ b/src/bin/pg_dump/pg_backup_db.c
-@@ -268,9 +268,9 @@ notice_processor(void *arg, const char *message)
+@@ -207,9 +207,9 @@ notice_processor(void *arg, const char *message)
  static void
  die_on_query_failure(ArchiveHandle *AH, const char *query)
  {
@@ -6688,7 +6737,7 @@ index a02841c4..f57d971a 100644
  	exit(1);
  }
  
-@@ -292,7 +292,7 @@ ExecuteSqlQuery(Archive *AHX, const char *query, ExecStatusType status)
+@@ -231,7 +231,7 @@ ExecuteSqlQuery(Archive *AHX, const char *query, ExecStatusType status)
  	ArchiveHandle *AH = (ArchiveHandle *) AHX;
  	PGresult   *res;
  
@@ -6698,10 +6747,10 @@ index a02841c4..f57d971a 100644
  		die_on_query_failure(AH, query);
  	return res;
 diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
-index 1188e346..fb48f383 100644
+index 618b0ea..0e0470a 100644
 --- a/src/bin/pg_dump/pg_dump.c
 +++ b/src/bin/pg_dump/pg_dump.c
-@@ -70,6 +70,30 @@
+@@ -71,6 +71,30 @@
  #include "pg_dump.h"
  #include "storage/block.h"
  
@@ -6732,7 +6781,7 @@ index 1188e346..fb48f383 100644
  typedef struct
  {
  	Oid			roleoid;		/* role's OID */
-@@ -426,7 +450,7 @@ main(int argc, char **argv)
+@@ -499,7 +523,7 @@ main(int argc, char **argv)
  		{"lock-wait-timeout", required_argument, NULL, 2},
  		{"no-table-access-method", no_argument, &dopt.outputNoTableAm, 1},
  		{"no-tablespaces", no_argument, &dopt.outputNoTablespaces, 1},
@@ -6741,7 +6790,7 @@ index 1188e346..fb48f383 100644
  		{"load-via-partition-root", no_argument, &dopt.load_via_partition_root, 1},
  		{"role", required_argument, NULL, 3},
  		{"section", required_argument, NULL, 5},
-@@ -849,12 +873,13 @@ main(int argc, char **argv)
+@@ -993,12 +1017,13 @@ main(int argc, char **argv)
  	fout->maxRemoteVersion = (PG_VERSION_NUM / 100) * 100 + 99;
  
  	fout->numWorkers = numWorkers;
@@ -6751,12 +6800,12 @@ index 1188e346..fb48f383 100644
  	 * Open the database using the Archiver, so it knows about it. Errors mean
  	 * death.
  	 */
- 	ConnectDatabase(fout, &dopt.cparams, false);
+ 	ConnectDatabaseAhx(fout, &dopt.cparams, false);
 +puts("# 838:" __FILE__ ": ConnectDatabase->setup_connection\r\n");
  	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
  
  	/*
-@@ -1303,7 +1328,7 @@ setup_connection(Archive *AH, const char *dumpencoding,
+@@ -1463,7 +1488,7 @@ setup_connection(Archive *AH, const char *dumpencoding,
  	/*
  	 * Quote all identifiers, if requested.
  	 */
@@ -6766,7 +6815,7 @@ index 1188e346..fb48f383 100644
  
  	/*
 diff --git a/src/bin/pg_dump/pg_dumpall.c b/src/bin/pg_dump/pg_dumpall.c
-index 0a0bfa9b..31dc1843 100644
+index 40b133b..75a80e5 100644
 --- a/src/bin/pg_dump/pg_dumpall.c
 +++ b/src/bin/pg_dump/pg_dumpall.c
 @@ -14,7 +14,13 @@
@@ -6784,7 +6833,7 @@ index 0a0bfa9b..31dc1843 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -165,7 +171,7 @@ main(int argc, char *argv[])
+@@ -164,7 +170,7 @@ main(int argc, char *argv[])
  		{"lock-wait-timeout", required_argument, NULL, 2},
  		{"no-table-access-method", no_argument, &no_table_access_method, 1},
  		{"no-tablespaces", no_argument, &no_tablespaces, 1},
@@ -6793,7 +6842,7 @@ index 0a0bfa9b..31dc1843 100644
  		{"load-via-partition-root", no_argument, &load_via_partition_root, 1},
  		{"role", required_argument, NULL, 3},
  		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
-@@ -448,7 +454,7 @@ main(int argc, char *argv[])
+@@ -460,7 +466,7 @@ main(int argc, char *argv[])
  		appendPQExpBufferStr(pgdumpopts, " --no-table-access-method");
  	if (no_tablespaces)
  		appendPQExpBufferStr(pgdumpopts, " --no-tablespaces");
@@ -6802,7 +6851,7 @@ index 0a0bfa9b..31dc1843 100644
  		appendPQExpBufferStr(pgdumpopts, " --quote-all-identifiers");
  	if (load_via_partition_root)
  		appendPQExpBufferStr(pgdumpopts, " --load-via-partition-root");
-@@ -559,7 +565,7 @@ main(int argc, char *argv[])
+@@ -588,7 +594,7 @@ main(int argc, char *argv[])
  	}
  
  	/* Force quoting of all identifiers if requested. */
@@ -6812,10 +6861,10 @@ index 0a0bfa9b..31dc1843 100644
  
  	fprintf(OPF, "--\n-- PostgreSQL database cluster dump\n--\n\n");
 diff --git a/src/bin/pg_resetwal/pg_resetwal.c b/src/bin/pg_resetwal/pg_resetwal.c
-index 6cb2bf47..b2c2a845 100644
+index efb515e..51dee2a 100644
 --- a/src/bin/pg_resetwal/pg_resetwal.c
 +++ b/src/bin/pg_resetwal/pg_resetwal.c
-@@ -339,7 +339,7 @@ main(int argc, char *argv[])
+@@ -358,7 +358,7 @@ main(int argc, char *argv[])
  	 * -- any other user won't have sufficient permissions to modify files in
  	 * the data directory.
  	 */
@@ -6825,7 +6874,7 @@ index 6cb2bf47..b2c2a845 100644
  	{
  		pg_log_error("cannot be executed by \"root\"");
 diff --git a/src/bin/pg_upgrade/parallel.c b/src/bin/pg_upgrade/parallel.c
-index 05313a9b..e19e2efb 100644
+index 056aa2e..ff6db5b 100644
 --- a/src/bin/pg_upgrade/parallel.c
 +++ b/src/bin/pg_upgrade/parallel.c
 @@ -277,6 +277,7 @@ win32_transfer_all_new_dbs(transfer_thread_arg *args)
@@ -6845,16 +6894,16 @@ index 05313a9b..e19e2efb 100644
  	return true;
  }
 diff --git a/src/bin/pg_verifybackup/pg_verifybackup.c b/src/bin/pg_verifybackup/pg_verifybackup.c
-index d77e70fb..f588d61c 100644
+index 48994ef..f588d61 100644
 --- a/src/bin/pg_verifybackup/pg_verifybackup.c
 +++ b/src/bin/pg_verifybackup/pg_verifybackup.c
-@@ -1,1104 +1 @@
+@@ -1,1384 +1 @@
 -/*-------------------------------------------------------------------------
 - *
 - * pg_verifybackup.c
 - *	  Verify a backup against a backup manifest.
 - *
-- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
 - * Portions Copyright (c) 1994, Regents of the University of California
 - *
 - * src/bin/pg_verifybackup/pg_verifybackup.c
@@ -6866,15 +6915,16 @@ index d77e70fb..f588d61c 100644
 -
 -#include <dirent.h>
 -#include <fcntl.h>
+-#include <limits.h>
 -#include <sys/stat.h>
 -#include <time.h>
 -
--#include "common/controldata_utils.h"
--#include "common/hashfn_unstable.h"
+-#include "access/xlog_internal.h"
 -#include "common/logging.h"
 -#include "common/parse_manifest.h"
 -#include "fe_utils/simple_list.h"
 -#include "getopt_long.h"
+-#include "pg_verifybackup.h"
 -#include "pgtime.h"
 -
 -/*
@@ -6897,76 +6947,14 @@ index d77e70fb..f588d61c 100644
 -#define READ_CHUNK_SIZE				(128 * 1024)
 -
 -/*
-- * Each file described by the manifest file is parsed to produce an object
-- * like this.
+- * Tar file information needed for content verification.
 - */
--typedef struct manifest_file
+-typedef struct tar_file
 -{
--	uint32		status;			/* hash status */
--	const char *pathname;
--	size_t		size;
--	pg_checksum_type checksum_type;
--	int			checksum_length;
--	uint8	   *checksum_payload;
--	bool		matched;
--	bool		bad;
--} manifest_file;
--
--#define should_verify_checksum(m) \
--	(((m)->matched) && !((m)->bad) && (((m)->checksum_type) != CHECKSUM_TYPE_NONE))
--
--/*
-- * Define a hash table which we can use to store information about the files
-- * mentioned in the backup manifest.
-- */
--#define SH_PREFIX		manifest_files
--#define SH_ELEMENT_TYPE	manifest_file
--#define SH_KEY_TYPE		const char *
--#define	SH_KEY			pathname
--#define SH_HASH_KEY(tb, key)	hash_string(key)
--#define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
--#define	SH_SCOPE		static inline
--#define SH_RAW_ALLOCATOR	pg_malloc0
--#define SH_DECLARE
--#define SH_DEFINE
--#include "lib/simplehash.h"
--
--/*
-- * Each WAL range described by the manifest file is parsed to produce an
-- * object like this.
-- */
--typedef struct manifest_wal_range
--{
--	TimeLineID	tli;
--	XLogRecPtr	start_lsn;
--	XLogRecPtr	end_lsn;
--	struct manifest_wal_range *next;
--	struct manifest_wal_range *prev;
--} manifest_wal_range;
--
--/*
-- * All the data parsed from a backup_manifest file.
-- */
--typedef struct manifest_data
--{
--	int			version;
--	uint64		system_identifier;
--	manifest_files_hash *files;
--	manifest_wal_range *first_wal_range;
--	manifest_wal_range *last_wal_range;
--} manifest_data;
--
--/*
-- * All of the context information we need while checking a backup manifest.
-- */
--typedef struct verifier_context
--{
--	manifest_data *manifest;
--	char	   *backup_directory;
--	SimpleStringList ignore_list;
--	bool		exit_on_error;
--	bool		saw_any_error;
--} verifier_context;
+-	char	   *relpath;
+-	Oid			tblspc_oid;
+-	pg_compress_algorithm compress_algorithm;
+-} tar_file;
 -
 -static manifest_data *parse_manifest_file(char *manifest_path);
 -static void verifybackup_version_cb(JsonManifestParseContext *context,
@@ -6974,7 +6962,7 @@ index d77e70fb..f588d61c 100644
 -static void verifybackup_system_identifier(JsonManifestParseContext *context,
 -										   uint64 manifest_system_identifier);
 -static void verifybackup_per_file_cb(JsonManifestParseContext *context,
--									 const char *pathname, size_t size,
+-									 const char *pathname, uint64 size,
 -									 pg_checksum_type checksum_type,
 -									 int checksum_length,
 -									 uint8 *checksum_payload);
@@ -6982,16 +6970,22 @@ index d77e70fb..f588d61c 100644
 -										  TimeLineID tli,
 -										  XLogRecPtr start_lsn,
 -										  XLogRecPtr end_lsn);
--static void report_manifest_error(JsonManifestParseContext *context,
--								  const char *fmt,...)
--			pg_attribute_printf(2, 3) pg_attribute_noreturn();
+-pg_noreturn static void report_manifest_error(JsonManifestParseContext *context,
+-											  const char *fmt,...)
+-			pg_attribute_printf(2, 3);
 -
--static void verify_backup_directory(verifier_context *context,
--									char *relpath, char *fullpath);
--static void verify_backup_file(verifier_context *context,
--							   char *relpath, char *fullpath);
+-static void verify_tar_backup(verifier_context *context, DIR *dir);
+-static void verify_plain_backup_directory(verifier_context *context,
+-										  char *relpath, char *fullpath,
+-										  DIR *dir);
+-static void verify_plain_backup_file(verifier_context *context, char *relpath,
+-									 char *fullpath);
 -static void verify_control_file(const char *controlpath,
 -								uint64 manifest_system_identifier);
+-static void precheck_tar_backup_file(verifier_context *context, char *relpath,
+-									 char *fullpath, SimplePtrList *tarfiles);
+-static void verify_tar_file(verifier_context *context, char *relpath,
+-							char *fullpath, astreamer *streamer);
 -static void report_extra_backup_files(verifier_context *context);
 -static void verify_backup_checksums(verifier_context *context);
 -static void verify_file_checksum(verifier_context *context,
@@ -7000,22 +6994,18 @@ index d77e70fb..f588d61c 100644
 -static void parse_required_wal(verifier_context *context,
 -							   char *pg_waldump_path,
 -							   char *wal_directory);
--
--static void report_backup_error(verifier_context *context,
--								const char *pg_restrict fmt,...)
--			pg_attribute_printf(2, 3);
--static void report_fatal_error(const char *pg_restrict fmt,...)
--			pg_attribute_printf(1, 2) pg_attribute_noreturn();
--static bool should_ignore_relpath(verifier_context *context, const char *relpath);
+-static astreamer *create_archive_verifier(verifier_context *context,
+-										  char *archive_name,
+-										  Oid tblspc_oid,
+-										  pg_compress_algorithm compress_algo);
 -
 -static void progress_report(bool finished);
 -static void usage(void);
 -
 -static const char *progname;
 -
--/* options */
+-/* is progress reporting enabled? */
 -static bool show_progress = false;
--static bool skip_checksums = false;
 -
 -/* Progress indicators */
 -static uint64 total_size = 0;
@@ -7031,6 +7021,7 @@ index d77e70fb..f588d61c 100644
 -		{"exit-on-error", no_argument, NULL, 'e'},
 -		{"ignore", required_argument, NULL, 'i'},
 -		{"manifest-path", required_argument, NULL, 'm'},
+-		{"format", required_argument, NULL, 'F'},
 -		{"no-parse-wal", no_argument, NULL, 'n'},
 -		{"progress", no_argument, NULL, 'P'},
 -		{"quiet", no_argument, NULL, 'q'},
@@ -7046,6 +7037,7 @@ index d77e70fb..f588d61c 100644
 -	bool		quiet = false;
 -	char	   *wal_directory = NULL;
 -	char	   *pg_waldump_path = NULL;
+-	DIR		   *dir;
 -
 -	pg_logging_init(argv[0]);
 -	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_verifybackup"));
@@ -7088,7 +7080,7 @@ index d77e70fb..f588d61c 100644
 -	simple_string_list_append(&context.ignore_list, "recovery.signal");
 -	simple_string_list_append(&context.ignore_list, "standby.signal");
 -
--	while ((c = getopt_long(argc, argv, "ei:m:nPqsw:", long_options, NULL)) != -1)
+-	while ((c = getopt_long(argc, argv, "eF:i:m:nPqsw:", long_options, NULL)) != -1)
 -	{
 -		switch (c)
 -		{
@@ -7107,6 +7099,15 @@ index d77e70fb..f588d61c 100644
 -				manifest_path = pstrdup(optarg);
 -				canonicalize_path(manifest_path);
 -				break;
+-			case 'F':
+-				if (strcmp(optarg, "p") == 0 || strcmp(optarg, "plain") == 0)
+-					context.format = 'p';
+-				else if (strcmp(optarg, "t") == 0 || strcmp(optarg, "tar") == 0)
+-					context.format = 't';
+-				else
+-					pg_fatal("invalid backup format \"%s\", must be \"plain\" or \"tar\"",
+-							 optarg);
+-				break;
 -			case 'n':
 -				no_parse_wal = true;
 -				break;
@@ -7117,7 +7118,7 @@ index d77e70fb..f588d61c 100644
 -				quiet = true;
 -				break;
 -			case 's':
--				skip_checksums = true;
+-				context.skip_checksums = true;
 -				break;
 -			case 'w':
 -				wal_directory = pstrdup(optarg);
@@ -7196,25 +7197,75 @@ index d77e70fb..f588d61c 100644
 -	context.manifest = parse_manifest_file(manifest_path);
 -
 -	/*
--	 * Now scan the files in the backup directory. At this stage, we verify
--	 * that every file on disk is present in the manifest and that the sizes
--	 * match. We also set the "matched" flag on every manifest entry that
--	 * corresponds to a file on disk.
+-	 * If the backup directory cannot be found, treat this as a fatal error.
 -	 */
--	verify_backup_directory(&context, NULL, context.backup_directory);
+-	dir = opendir(context.backup_directory);
+-	if (dir == NULL)
+-		report_fatal_error("could not open directory \"%s\": %m",
+-						   context.backup_directory);
+-
+-	/*
+-	 * At this point, we know that the backup directory exists, so it's now
+-	 * reasonable to check for files immediately inside it. Thus, before going
+-	 * further, if the user did not specify the backup format, check for
+-	 * PG_VERSION to distinguish between tar and plain format.
+-	 */
+-	if (context.format == '\0')
+-	{
+-		struct stat sb;
+-		char	   *path;
+-
+-		path = psprintf("%s/%s", context.backup_directory, "PG_VERSION");
+-		if (stat(path, &sb) == 0)
+-			context.format = 'p';
+-		else if (errno != ENOENT)
+-		{
+-			pg_log_error("could not stat file \"%s\": %m", path);
+-			exit(1);
+-		}
+-		else
+-		{
+-			/* No PG_VERSION, so assume tar format. */
+-			context.format = 't';
+-		}
+-		pfree(path);
+-	}
+-
+-	/*
+-	 * XXX: In the future, we should consider enhancing pg_waldump to read WAL
+-	 * files from an archive.
+-	 */
+-	if (!no_parse_wal && context.format == 't')
+-	{
+-		pg_log_error("pg_waldump cannot read tar files");
+-		pg_log_error_hint("You must use -n/--no-parse-wal when verifying a tar-format backup.");
+-		exit(1);
+-	}
+-
+-	/*
+-	 * Perform the appropriate type of verification appropriate based on the
+-	 * backup format. This will close 'dir'.
+-	 */
+-	if (context.format == 'p')
+-		verify_plain_backup_directory(&context, NULL, context.backup_directory,
+-									  dir);
+-	else
+-		verify_tar_backup(&context, dir);
 -
 -	/*
 -	 * The "matched" flag should now be set on every entry in the hash table.
 -	 * Any entries for which the bit is not set are files mentioned in the
--	 * manifest that don't exist on disk.
+-	 * manifest that don't exist on disk (or in the relevant tar files).
 -	 */
 -	report_extra_backup_files(&context);
 -
 -	/*
--	 * Now do the expensive work of verifying file checksums, unless we were
--	 * told to skip it.
+-	 * If this is a tar-format backup, checksums were already verified above;
+-	 * but if it's a plain-format backup, we postpone it until this point,
+-	 * since the earlier checks can be performed just by knowing which files
+-	 * are present, without needing to read all of them.
 -	 */
--	if (!skip_checksums)
+-	if (context.format == 'p' && !context.skip_checksums)
 -		verify_backup_checksums(&context);
 -
 -	/*
@@ -7397,7 +7448,7 @@ index d77e70fb..f588d61c 100644
 - */
 -static void
 -verifybackup_per_file_cb(JsonManifestParseContext *context,
--						 const char *pathname, size_t size,
+-						 const char *pathname, uint64 size,
 -						 pg_checksum_type checksum_type,
 -						 int checksum_length, uint8 *checksum_payload)
 -{
@@ -7449,35 +7500,27 @@ index d77e70fb..f588d61c 100644
 -}
 -
 -/*
-- * Verify one directory.
+- * Verify one directory of a plain-format backup.
 - *
 - * 'relpath' is NULL if we are to verify the top-level backup directory,
 - * and otherwise the relative path to the directory that is to be verified.
 - *
 - * 'fullpath' is the backup directory with 'relpath' appended; i.e. the actual
 - * filesystem path at which it can be found.
+- *
+- * 'dir' is an open directory handle, or NULL if the caller wants us to
+- * open it. If the caller chooses to pass a handle, we'll close it when
+- * we're done with it.
 - */
 -static void
--verify_backup_directory(verifier_context *context, char *relpath,
--						char *fullpath)
+-verify_plain_backup_directory(verifier_context *context, char *relpath,
+-							  char *fullpath, DIR *dir)
 -{
--	DIR		   *dir;
 -	struct dirent *dirent;
 -
--	dir = opendir(fullpath);
--	if (dir == NULL)
+-	/* Open the directory unless the caller did it. */
+-	if (dir == NULL && ((dir = opendir(fullpath)) == NULL))
 -	{
--		/*
--		 * If even the toplevel backup directory cannot be found, treat this
--		 * as a fatal error.
--		 */
--		if (relpath == NULL)
--			report_fatal_error("could not open directory \"%s\": %m", fullpath);
--
--		/*
--		 * Otherwise, treat this as a non-fatal error, but ignore any further
--		 * errors related to this path and anything beneath it.
--		 */
 -		report_backup_error(context,
 -							"could not open directory \"%s\": %m", fullpath);
 -		simple_string_list_append(&context->ignore_list, relpath);
@@ -7502,7 +7545,7 @@ index d77e70fb..f588d61c 100644
 -			newrelpath = psprintf("%s/%s", relpath, filename);
 -
 -		if (!should_ignore_relpath(context, newrelpath))
--			verify_backup_file(context, newrelpath, newfullpath);
+-			verify_plain_backup_file(context, newrelpath, newfullpath);
 -
 -		pfree(newfullpath);
 -		pfree(newrelpath);
@@ -7519,11 +7562,12 @@ index d77e70fb..f588d61c 100644
 -/*
 - * Verify one file (which might actually be a directory or a symlink).
 - *
-- * The arguments to this function have the same meaning as the arguments to
-- * verify_backup_directory.
+- * The arguments to this function have the same meaning as the similarly named
+- * arguments to verify_plain_backup_directory.
 - */
 -static void
--verify_backup_file(verifier_context *context, char *relpath, char *fullpath)
+-verify_plain_backup_file(verifier_context *context, char *relpath,
+-						 char *fullpath)
 -{
 -	struct stat sb;
 -	manifest_file *m;
@@ -7546,15 +7590,15 @@ index d77e70fb..f588d61c 100644
 -	/* If it's a directory, just recurse. */
 -	if (S_ISDIR(sb.st_mode))
 -	{
--		verify_backup_directory(context, relpath, fullpath);
+-		verify_plain_backup_directory(context, relpath, fullpath, NULL);
 -		return;
 -	}
 -
--	/* If it's not a directory, it should be a plain file. */
+-	/* If it's not a directory, it should be a regular file. */
 -	if (!S_ISREG(sb.st_mode))
 -	{
 -		report_backup_error(context,
--							"\"%s\" is not a file or directory",
+-							"\"%s\" is not a regular file or directory",
 -							relpath);
 -		return;
 -	}
@@ -7576,8 +7620,9 @@ index d77e70fb..f588d61c 100644
 -	if (m->size != sb.st_size)
 -	{
 -		report_backup_error(context,
--							"\"%s\" has size %lld on disk but size %zu in the manifest",
--							relpath, (long long int) sb.st_size, m->size);
+-							"\"%s\" has size %llu on disk but size %llu in the manifest",
+-							relpath, (unsigned long long) sb.st_size,
+-							(unsigned long long) m->size);
 -		m->bad = true;
 -	}
 -
@@ -7586,11 +7631,12 @@ index d77e70fb..f588d61c 100644
 -	 * version 1.
 -	 */
 -	if (context->manifest->version != 1 &&
--		strcmp(relpath, "global/pg_control") == 0)
+-		strcmp(relpath, XLOG_CONTROL_FILE) == 0)
 -		verify_control_file(fullpath, context->manifest->system_identifier);
 -
 -	/* Update statistics for progress report, if necessary */
--	if (show_progress && !skip_checksums && should_verify_checksum(m))
+-	if (show_progress && !context->skip_checksums &&
+-		should_verify_checksum(m))
 -		total_size += m->size;
 -
 -	/*
@@ -7625,13 +7671,264 @@ index d77e70fb..f588d61c 100644
 -
 -	/* System identifiers should match. */
 -	if (manifest_system_identifier != control_file->system_identifier)
--		report_fatal_error("%s: manifest system identifier is %llu, but control file has %llu",
+-		report_fatal_error("%s: manifest system identifier is %" PRIu64 ", but control file has %" PRIu64,
 -						   controlpath,
--						   (unsigned long long) manifest_system_identifier,
--						   (unsigned long long) control_file->system_identifier);
+-						   manifest_system_identifier,
+-						   control_file->system_identifier);
 -
 -	/* Release memory. */
 -	pfree(control_file);
+-}
+-
+-/*
+- * Verify tar backup.
+- *
+- * The caller should pass a handle to the target directory, which we will
+- * close when we're done with it.
+- */
+-static void
+-verify_tar_backup(verifier_context *context, DIR *dir)
+-{
+-	struct dirent *dirent;
+-	SimplePtrList tarfiles = {NULL, NULL};
+-	SimplePtrListCell *cell;
+-
+-	Assert(context->format != 'p');
+-
+-	progress_report(false);
+-
+-	/* First pass: scan the directory for tar files. */
+-	while (errno = 0, (dirent = readdir(dir)) != NULL)
+-	{
+-		char	   *filename = dirent->d_name;
+-
+-		/* Skip "." and ".." */
+-		if (filename[0] == '.' && (filename[1] == '\0'
+-								   || strcmp(filename, "..") == 0))
+-			continue;
+-
+-		/*
+-		 * Unless it's something we should ignore, perform prechecks and add
+-		 * it to the list.
+-		 */
+-		if (!should_ignore_relpath(context, filename))
+-		{
+-			char	   *fullpath;
+-
+-			fullpath = psprintf("%s/%s", context->backup_directory, filename);
+-			precheck_tar_backup_file(context, filename, fullpath, &tarfiles);
+-			pfree(fullpath);
+-		}
+-	}
+-
+-	if (closedir(dir))
+-	{
+-		report_backup_error(context,
+-							"could not close directory \"%s\": %m",
+-							context->backup_directory);
+-		return;
+-	}
+-
+-	/* Second pass: Perform the final verification of the tar contents. */
+-	for (cell = tarfiles.head; cell != NULL; cell = cell->next)
+-	{
+-		tar_file   *tar = (tar_file *) cell->ptr;
+-		astreamer  *streamer;
+-		char	   *fullpath;
+-
+-		/*
+-		 * Prepares the archive streamer stack according to the tar
+-		 * compression format.
+-		 */
+-		streamer = create_archive_verifier(context,
+-										   tar->relpath,
+-										   tar->tblspc_oid,
+-										   tar->compress_algorithm);
+-
+-		/* Compute the full pathname to the target file. */
+-		fullpath = psprintf("%s/%s", context->backup_directory,
+-							tar->relpath);
+-
+-		/* Invoke the streamer for reading, decompressing, and verifying. */
+-		verify_tar_file(context, tar->relpath, fullpath, streamer);
+-
+-		/* Cleanup. */
+-		pfree(tar->relpath);
+-		pfree(tar);
+-		pfree(fullpath);
+-
+-		astreamer_finalize(streamer);
+-		astreamer_free(streamer);
+-	}
+-	simple_ptr_list_destroy(&tarfiles);
+-
+-	progress_report(true);
+-}
+-
+-/*
+- * Preparatory steps for verifying files in tar format backups.
+- *
+- * Carries out basic validation of the tar format backup file, detects the
+- * compression type, and appends that information to the tarfiles list. An
+- * error will be reported if the tar file is inaccessible, or if the file type,
+- * name, or compression type is not as expected.
+- *
+- * The arguments to this function are mostly the same as the
+- * verify_plain_backup_file. The additional argument outputs a list of valid
+- * tar files.
+- */
+-static void
+-precheck_tar_backup_file(verifier_context *context, char *relpath,
+-						 char *fullpath, SimplePtrList *tarfiles)
+-{
+-	struct stat sb;
+-	Oid			tblspc_oid = InvalidOid;
+-	pg_compress_algorithm compress_algorithm;
+-	tar_file   *tar;
+-	char	   *suffix = NULL;
+-
+-	/* Should be tar format backup */
+-	Assert(context->format == 't');
+-
+-	/* Get file information */
+-	if (stat(fullpath, &sb) != 0)
+-	{
+-		report_backup_error(context,
+-							"could not stat file or directory \"%s\": %m",
+-							relpath);
+-		return;
+-	}
+-
+-	/* In a tar format backup, we expect only regular files. */
+-	if (!S_ISREG(sb.st_mode))
+-	{
+-		report_backup_error(context,
+-							"file \"%s\" is not a regular file",
+-							relpath);
+-		return;
+-	}
+-
+-	/*
+-	 * We expect tar files for backing up the main directory, tablespace, and
+-	 * pg_wal directory.
+-	 *
+-	 * pg_basebackup writes the main data directory to an archive file named
+-	 * base.tar, the pg_wal directory to pg_wal.tar, and the tablespace
+-	 * directory to <tablespaceoid>.tar, each followed by a compression type
+-	 * extension such as .gz, .lz4, or .zst.
+-	 */
+-	if (strncmp("base", relpath, 4) == 0)
+-		suffix = relpath + 4;
+-	else if (strncmp("pg_wal", relpath, 6) == 0)
+-		suffix = relpath + 6;
+-	else
+-	{
+-		/* Expected a <tablespaceoid>.tar file here. */
+-		uint64		num = strtoul(relpath, &suffix, 10);
+-
+-		/*
+-		 * Report an error if we didn't consume at least one character, if the
+-		 * result is 0, or if the value is too large to be a valid OID.
+-		 */
+-		if (suffix == NULL || num <= 0 || num > OID_MAX)
+-		{
+-			report_backup_error(context,
+-								"file \"%s\" is not expected in a tar format backup",
+-								relpath);
+-			return;
+-		}
+-		tblspc_oid = (Oid) num;
+-	}
+-
+-	/* Now, check the compression type of the tar */
+-	if (strcmp(suffix, ".tar") == 0)
+-		compress_algorithm = PG_COMPRESSION_NONE;
+-	else if (strcmp(suffix, ".tgz") == 0)
+-		compress_algorithm = PG_COMPRESSION_GZIP;
+-	else if (strcmp(suffix, ".tar.gz") == 0)
+-		compress_algorithm = PG_COMPRESSION_GZIP;
+-	else if (strcmp(suffix, ".tar.lz4") == 0)
+-		compress_algorithm = PG_COMPRESSION_LZ4;
+-	else if (strcmp(suffix, ".tar.zst") == 0)
+-		compress_algorithm = PG_COMPRESSION_ZSTD;
+-	else
+-	{
+-		report_backup_error(context,
+-							"file \"%s\" is not expected in a tar format backup",
+-							relpath);
+-		return;
+-	}
+-
+-	/*
+-	 * Ignore WALs, as reading and verification will be handled through
+-	 * pg_waldump.
+-	 */
+-	if (strncmp("pg_wal", relpath, 6) == 0)
+-		return;
+-
+-	/*
+-	 * Append the information to the list for complete verification at a later
+-	 * stage.
+-	 */
+-	tar = pg_malloc(sizeof(tar_file));
+-	tar->relpath = pstrdup(relpath);
+-	tar->tblspc_oid = tblspc_oid;
+-	tar->compress_algorithm = compress_algorithm;
+-
+-	simple_ptr_list_append(tarfiles, tar);
+-
+-	/* Update statistics for progress report, if necessary */
+-	if (show_progress)
+-		total_size += sb.st_size;
+-}
+-
+-/*
+- * Verification of a single tar file content.
+- *
+- * It reads a given tar archive in predefined chunks and passes it to the
+- * streamer, which initiates routines for decompression (if necessary) and then
+- * verifies each member within the tar file.
+- */
+-static void
+-verify_tar_file(verifier_context *context, char *relpath, char *fullpath,
+-				astreamer *streamer)
+-{
+-	int			fd;
+-	int			rc;
+-	char	   *buffer;
+-
+-	pg_log_debug("reading \"%s\"", fullpath);
+-
+-	/* Open the target file. */
+-	if ((fd = open(fullpath, O_RDONLY | PG_BINARY, 0)) < 0)
+-	{
+-		report_backup_error(context, "could not open file \"%s\": %m",
+-							relpath);
+-		return;
+-	}
+-
+-	buffer = pg_malloc(READ_CHUNK_SIZE * sizeof(uint8));
+-
+-	/* Perform the reads */
+-	while ((rc = read(fd, buffer, READ_CHUNK_SIZE)) > 0)
+-	{
+-		astreamer_content(streamer, NULL, buffer, rc, ASTREAMER_UNKNOWN);
+-
+-		/* Report progress */
+-		done_size += rc;
+-		progress_report(false);
+-	}
+-
+-	pg_free(buffer);
+-
+-	if (rc < 0)
+-		report_backup_error(context, "could not read file \"%s\": %m",
+-							relpath);
+-
+-	/* Close the file. */
+-	if (close(fd) != 0)
+-		report_backup_error(context, "could not close file \"%s\": %m",
+-							relpath);
 -}
 -
 -/*
@@ -7706,7 +8003,7 @@ index d77e70fb..f588d61c 100644
 -	const char *relpath = m->pathname;
 -	int			fd;
 -	int			rc;
--	size_t		bytes_read = 0;
+-	uint64		bytes_read = 0;
 -	uint8		checksumbuf[PG_CHECKSUM_MAX_LENGTH];
 -	int			checksumlen;
 -
@@ -7761,15 +8058,15 @@ index d77e70fb..f588d61c 100644
 -
 -	/*
 -	 * Double-check that we read the expected number of bytes from the file.
--	 * Normally, a file size mismatch would be caught in verify_backup_file
--	 * and this check would never be reached, but this provides additional
--	 * safety and clarity in the event of concurrent modifications or
--	 * filesystem misbehavior.
+-	 * Normally, mismatches would be caught in verify_plain_backup_file and
+-	 * this check would never be reached, but this provides additional safety
+-	 * and clarity in the event of concurrent modifications or filesystem
+-	 * misbehavior.
 -	 */
 -	if (bytes_read != m->size)
 -	{
 -		report_backup_error(context,
--							"file \"%s\" should contain %zu bytes, but read %zu bytes",
+-							"file \"%s\" should contain %" PRIu64 " bytes, but read %" PRIu64,
 -							relpath, m->size, bytes_read);
 -		return;
 -	}
@@ -7830,7 +8127,7 @@ index d77e70fb..f588d61c 100644
 - * Update the context to indicate that we saw an error, and exit if the
 - * context says we should.
 - */
--static void
+-void
 -report_backup_error(verifier_context *context, const char *pg_restrict fmt,...)
 -{
 -	va_list		ap;
@@ -7847,7 +8144,7 @@ index d77e70fb..f588d61c 100644
 -/*
 - * Report a fatal error and exit
 - */
--static void
+-void
 -report_fatal_error(const char *pg_restrict fmt,...)
 -{
 -	va_list		ap;
@@ -7866,7 +8163,7 @@ index d77e70fb..f588d61c 100644
 - * Note that by "prefix" we mean a parent directory; for this purpose,
 - * "aa/bb" is not a prefix of "aa/bbb", but it is a prefix of "aa/bb/cc".
 - */
--static bool
+-bool
 -should_ignore_relpath(verifier_context *context, const char *relpath)
 -{
 -	SimpleStringListCell *cell;
@@ -7884,6 +8181,37 @@ index d77e70fb..f588d61c 100644
 -	}
 -
 -	return false;
+-}
+-
+-/*
+- * Create a chain of archive streamers appropriate for verifying a given
+- * archive.
+- */
+-static astreamer *
+-create_archive_verifier(verifier_context *context, char *archive_name,
+-						Oid tblspc_oid, pg_compress_algorithm compress_algo)
+-{
+-	astreamer  *streamer = NULL;
+-
+-	/* Should be here only for tar backup */
+-	Assert(context->format == 't');
+-
+-	/* Last step is the actual verification. */
+-	streamer = astreamer_verify_content_new(streamer, context, archive_name,
+-											tblspc_oid);
+-
+-	/* Before that we must parse the tar file. */
+-	streamer = astreamer_tar_parser_new(streamer);
+-
+-	/* Before that we must decompress, if archive is compressed. */
+-	if (compress_algo == PG_COMPRESSION_GZIP)
+-		streamer = astreamer_gzip_decompressor_new(streamer);
+-	else if (compress_algo == PG_COMPRESSION_LZ4)
+-		streamer = astreamer_lz4_decompressor_new(streamer);
+-	else if (compress_algo == PG_COMPRESSION_ZSTD)
+-		streamer = astreamer_zstd_decompressor_new(streamer);
+-
+-	return streamer;
 -}
 -
 -/*
@@ -7941,6 +8269,7 @@ index d77e70fb..f588d61c 100644
 -	printf(_("Usage:\n  %s [OPTION]... BACKUPDIR\n\n"), progname);
 -	printf(_("Options:\n"));
 -	printf(_("  -e, --exit-on-error         exit immediately on error\n"));
+-	printf(_("  -F, --format=p|t            backup format (plain, tar)\n"));
 -	printf(_("  -i, --ignore=RELATIVE_PATH  ignore indicated path\n"));
 -	printf(_("  -m, --manifest-path=PATH    use specified path for manifest\n"));
 -	printf(_("  -n, --no-parse-wal          do not try to parse WAL files\n"));
@@ -7955,10 +8284,10 @@ index d77e70fb..f588d61c 100644
 -}
 +int main(int argc, char *argv[]){return 0;}
 diff --git a/src/bin/psql/command.c b/src/bin/psql/command.c
-index bbb1888c..33dd0b30 100644
+index 09a1e79..f68e93f 100644
 --- a/src/bin/psql/command.c
 +++ b/src/bin/psql/command.c
-@@ -5336,6 +5336,10 @@ do_shell(const char *command)
+@@ -5872,6 +5872,10 @@ do_shell(const char *command)
  static bool
  do_watch(PQExpBuffer query_buf, double sleep, int iter, int min_rows)
  {
@@ -7969,7 +8298,7 @@ index bbb1888c..33dd0b30 100644
  	long		sleep_ms = (long) (sleep * 1000);
  	printQueryOpt myopt = pset.popt;
  	const char *strftime_fmt;
-@@ -5568,6 +5572,7 @@ do_watch(PQExpBuffer query_buf, double sleep, int iter, int min_rows)
+@@ -6104,6 +6108,7 @@ do_watch(PQExpBuffer query_buf, double sleep, int iter, int min_rows)
  
  	pg_free(title);
  	return (res >= 0);
@@ -7978,7 +8307,7 @@ index bbb1888c..33dd0b30 100644
  
  /*
 diff --git a/src/common/exec.c b/src/common/exec.c
-index 0bee19c1..379a6799 100644
+index 8b690a1..1919e30 100644
 --- a/src/common/exec.c
 +++ b/src/common/exec.c
 @@ -22,7 +22,7 @@
@@ -7991,7 +8320,7 @@ index 0bee19c1..379a6799 100644
  #include "postgres.h"
  #else
 diff --git a/src/common/logging.c b/src/common/logging.c
-index e9a02e3e..878853c1 100644
+index 125a172..7fde16c 100644
 --- a/src/common/logging.c
 +++ b/src/common/logging.c
 @@ -19,8 +19,9 @@
@@ -8006,7 +8335,7 @@ index e9a02e3e..878853c1 100644
  
  static void (*log_pre_callback) (void);
 diff --git a/src/common/pg_get_line.c b/src/common/pg_get_line.c
-index ea37a359..d1dfc730 100644
+index 8d28a0a..0e3ce78 100644
 --- a/src/common/pg_get_line.c
 +++ b/src/common/pg_get_line.c
 @@ -125,7 +125,7 @@ pg_get_line_append(FILE *stream, StringInfo buf,
@@ -8028,7 +8357,7 @@ index ea37a359..d1dfc730 100644
  	for (;;)
  	{
 diff --git a/src/fe_utils/connect_utils.c b/src/fe_utils/connect_utils.c
-index 5ed9f3ba..9be315ac 100644
+index cda1c11..6e7c587 100644
 --- a/src/fe_utils/connect_utils.c
 +++ b/src/fe_utils/connect_utils.c
 @@ -35,7 +35,7 @@ connectDatabase(const ConnParams *cparams, const char *progname,
@@ -8062,7 +8391,7 @@ index 5ed9f3ba..9be315ac 100644
  }
  
 diff --git a/src/fe_utils/print.c b/src/fe_utils/print.c
-index 92b5df74..0f20ed4e 100644
+index 4e135ab..4f3b76b 100644
 --- a/src/fe_utils/print.c
 +++ b/src/fe_utils/print.c
 @@ -15,6 +15,7 @@
@@ -8074,7 +8403,7 @@ index 92b5df74..0f20ed4e 100644
  
  #include <limits.h>
 diff --git a/src/fe_utils/query_utils.c b/src/fe_utils/query_utils.c
-index 4970c457..bf755915 100644
+index 1fa727a..be82f9d 100644
 --- a/src/fe_utils/query_utils.c
 +++ b/src/fe_utils/query_utils.c
 @@ -30,8 +30,8 @@ executeQuery(PGconn *conn, const char *query, bool echo)
@@ -8100,7 +8429,7 @@ index 4970c457..bf755915 100644
  		exit(1);
  	}
 diff --git a/src/fe_utils/string_utils.c b/src/fe_utils/string_utils.c
-index 4439c683..352a7fac 100644
+index 0e2a825..39bc5fe 100644
 --- a/src/fe_utils/string_utils.c
 +++ b/src/fe_utils/string_utils.c
 @@ -24,7 +24,9 @@
@@ -8124,7 +8453,7 @@ index 4439c683..352a7fac 100644
  	/* slightly different rules for first character */
  	else if (!((rawid[0] >= 'a' && rawid[0] <= 'z') || rawid[0] == '_'))
 diff --git a/src/include/bootstrap/bootstrap.h b/src/include/bootstrap/bootstrap.h
-index 73b78b31..a48899dc 100644
+index befc4fa..bad128a 100644
 --- a/src/include/bootstrap/bootstrap.h
 +++ b/src/include/bootstrap/bootstrap.h
 @@ -32,8 +32,11 @@ extern PGDLLIMPORT Relation boot_reldesc;
@@ -8135,24 +8464,24 @@ index 73b78b31..a48899dc 100644
 +#if defined(__EMSCRIPTEN__) || defined(__wasi__)
 +    int BootstrapModeMain(int argc, char *argv[], bool check_only);
 +#else
- extern void BootstrapModeMain(int argc, char *argv[], bool check_only) pg_attribute_noreturn();
+ pg_noreturn extern void BootstrapModeMain(int argc, char *argv[], bool check_only);
 +#endif
  
  extern void closerel(char *relname);
  extern void boot_openrel(char *relname);
 diff --git a/src/include/common/file_utils.h b/src/include/common/file_utils.h
-index e4339fb7..ad07b3cb 100644
+index 9fd8895..59f87e9 100644
 --- a/src/include/common/file_utils.h
 +++ b/src/include/common/file_utils.h
-@@ -33,11 +33,15 @@ typedef enum DataDirSyncMethod
- struct iovec;					/* avoid including port/pg_iovec.h here */
+@@ -34,11 +34,15 @@ struct iovec;					/* avoid including port/pg_iovec.h here */
  
  #ifdef FRONTEND
+ extern int	pre_sync_fname(const char *fname, bool isdir);
 +#if !defined(fsync_fname)
  extern int	fsync_fname(const char *fname, bool isdir);
 +#endif /* src/include/storage/fd.h */
  extern void sync_pgdata(const char *pg_data, int serverVersion,
- 						DataDirSyncMethod sync_method);
+ 						DataDirSyncMethod sync_method, bool sync_data_files);
  extern void sync_dir_recurse(const char *dir, DataDirSyncMethod sync_method);
 +#if !defined(durable_rename)
  extern int	durable_rename(const char *oldfile, const char *newfile);
@@ -8161,7 +8490,7 @@ index e4339fb7..ad07b3cb 100644
  #endif
  
 diff --git a/src/include/common/logging.h b/src/include/common/logging.h
-index afbd9c05..999615e7 100644
+index 81529ee..6528b0d 100644
 --- a/src/include/common/logging.h
 +++ b/src/include/common/logging.h
 @@ -91,7 +91,6 @@ void		pg_logging_set_level(enum pg_log_level new_level);
@@ -8173,7 +8502,7 @@ index afbd9c05..999615e7 100644
  						   const char *pg_restrict fmt,...)
  			pg_attribute_printf(3, 4);
 diff --git a/src/include/fe_utils/string_utils.h b/src/include/fe_utils/string_utils.h
-index ee99daeb..e14202b8 100644
+index b1052c3..af77b16 100644
 --- a/src/include/fe_utils/string_utils.h
 +++ b/src/include/fe_utils/string_utils.h
 @@ -16,11 +16,16 @@
@@ -8195,10 +8524,10 @@ index ee99daeb..e14202b8 100644
  
  /* Functions */
 diff --git a/src/include/fmgr.h b/src/include/fmgr.h
-index ccb4070a..7c960bcc 100644
+index 0fe7b4e..3c16e5f 100644
 --- a/src/include/fmgr.h
 +++ b/src/include/fmgr.h
-@@ -505,7 +505,10 @@ PG_MAGIC_FUNCTION_NAME(void) \
+@@ -545,7 +545,12 @@ PG_MAGIC_FUNCTION_NAME(void) \
  	return &Pg_magic_data; \
  } \
  extern int no_such_variable
@@ -8206,12 +8535,14 @@ index ccb4070a..7c960bcc 100644
 +#if defined(__wasi__) && !defined(__EMSCRIPTEN__)
 +#undef PG_MODULE_MAGIC
 +#define PG_MODULE_MAGIC
++#undef PG_MODULE_MAGIC_EXT
++#define PG_MODULE_MAGIC_EXT(...)
 +#endif
  
  /*-------------------------------------------------------------------------
   *		Support routines and macros for callers of fmgr-compatible functions
 diff --git a/src/include/libpq/be-fsstubs.h b/src/include/libpq/be-fsstubs.h
-index 336b9cef..0d6c7124 100644
+index 1b00643..3d7e4a2 100644
 --- a/src/include/libpq/be-fsstubs.h
 +++ b/src/include/libpq/be-fsstubs.h
 @@ -19,8 +19,10 @@
@@ -8229,7 +8560,7 @@ index 336b9cef..0d6c7124 100644
   * Cleanup LOs at xact commit/abort
 diff --git a/src/include/port/emscripten.h b/src/include/port/emscripten.h
 new file mode 100644
-index 00000000..db4903aa
+index 0000000..db4903a
 --- /dev/null
 +++ b/src/include/port/emscripten.h
 @@ -0,0 +1,17 @@
@@ -8251,7 +8582,7 @@ index 00000000..db4903aa
 +
 +#endif // I_WASM
 diff --git a/src/include/port/pg_pthread.h b/src/include/port/pg_pthread.h
-index d102ce9d..6922eb42 100644
+index 4dbb3c8..b68bb0f 100644
 --- a/src/include/port/pg_pthread.h
 +++ b/src/include/port/pg_pthread.h
 @@ -12,7 +12,9 @@
@@ -8262,7 +8593,7 @@ index d102ce9d..6922eb42 100644
 +#if defined(__wasi__)
 +#define PYDK
 +#endif /* __wasi__ */
- #include <pthread.h>
+ #include <pthread.h>			/* IWYU pragma: export */
  
  #ifndef HAVE_PTHREAD_BARRIER_WAIT
 @@ -20,7 +22,7 @@
@@ -8290,10 +8621,10 @@ index d102ce9d..6922eb42 100644
  
 diff --git a/src/include/port/wasi.h b/src/include/port/wasi.h
 new file mode 100644
-index 00000000..a811ab78
+index 0000000..a811ab7
 --- /dev/null
 +++ b/src/include/port/wasi.h
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,234 @@
 +#pragma once
 +
 +#ifndef I_WASI
@@ -8431,6 +8762,11 @@ index 00000000..a811ab78
 +    return -1;
 +}
 +
++static int
++setrlimit(int resource, const struct rlimit *rlim) {
++    return -1;
++}
++
 +/*
 +
 +static int
@@ -8525,7 +8861,7 @@ index 00000000..a811ab78
 +
 diff --git a/src/include/port/wasm_common.h b/src/include/port/wasm_common.h
 new file mode 100644
-index 00000000..6f53f0fc
+index 0000000..6f53f0f
 --- /dev/null
 +++ b/src/include/port/wasm_common.h
 @@ -0,0 +1,245 @@
@@ -8774,8 +9110,26 @@ index 00000000..6f53f0fc
 +
 +#endif // PG_SHMEM
 +
+diff --git a/src/include/storage/aio.h b/src/include/storage/aio.h
+index 2933eea..a64876a 100644
+--- a/src/include/storage/aio.h
++++ b/src/include/storage/aio.h
+@@ -38,8 +38,12 @@ typedef enum IoMethod
+ #endif
+ }			IoMethod;
+ 
+-/* We'll default to worker based execution. */
++/* We'll default to worker based execution, except on single-process WASM/WASI. */
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#define DEFAULT_IO_METHOD IOMETHOD_SYNC
++#else
+ #define DEFAULT_IO_METHOD IOMETHOD_WORKER
++#endif
+ 
+ 
+ /*
 diff --git a/src/include/storage/dsm_impl.h b/src/include/storage/dsm_impl.h
-index 88226960..5246c841 100644
+index 7248cb1..250de87 100644
 --- a/src/include/storage/dsm_impl.h
 +++ b/src/include/storage/dsm_impl.h
 @@ -23,20 +23,49 @@
@@ -8849,10 +9203,10 @@ index 88226960..5246c841 100644
  typedef uint32 dsm_handle;
  
 diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
-index b709a860..3b356645 100644
+index 75aee33..798e841 100644
 --- a/src/include/storage/fd.h
 +++ b/src/include/storage/fd.h
-@@ -196,13 +196,23 @@ extern int	pg_fdatasync(int fd);
+@@ -199,13 +199,23 @@ extern int	pg_fdatasync(int fd);
  extern bool pg_file_exists(const char *name);
  extern void pg_flush_data(int fd, off_t offset, off_t nbytes);
  extern int	pg_truncate(const char *path, off_t length);
@@ -8879,7 +9233,7 @@ index b709a860..3b356645 100644
  FileRead(File file, void *buffer, size_t amount, off_t offset,
  		 uint32 wait_event_info)
 diff --git a/src/include/storage/ipc.h b/src/include/storage/ipc.h
-index b2d06278..d5aebb72 100644
+index 3baf418..40d5682 100644
 --- a/src/include/storage/ipc.h
 +++ b/src/include/storage/ipc.h
 @@ -64,8 +64,11 @@ typedef void (*shmem_startup_hook_type) (void);
@@ -8890,13 +9244,13 @@ index b2d06278..d5aebb72 100644
 +#if defined(__EMSCRIPTEN__) || defined(__wasi__)
 +extern void pg_proc_exit(int code);
 +#else
- extern void proc_exit(int code) pg_attribute_noreturn();
+ pg_noreturn extern void proc_exit(int code);
 +#endif
  extern void shmem_exit(int code);
  extern void on_proc_exit(pg_on_exit_callback function, Datum arg);
  extern void on_shmem_exit(pg_on_exit_callback function, Datum arg);
 diff --git a/src/include/utils/elog.h b/src/include/utils/elog.h
-index 18a9fed1..1ee41d61 100644
+index 581b390..0366f8a 100644
 --- a/src/include/utils/elog.h
 +++ b/src/include/utils/elog.h
 @@ -137,6 +137,19 @@ struct Node;
@@ -8929,7 +9283,7 @@ index 18a9fed1..1ee41d61 100644
  	ereport_domain(elevel, TEXTDOMAIN, __VA_ARGS__)
  
 diff --git a/src/include/utils/palloc.h b/src/include/utils/palloc.h
-index c49ef6de..848f02d2 100644
+index e5d3f09..3e644c5 100644
 --- a/src/include/utils/palloc.h
 +++ b/src/include/utils/palloc.h
 @@ -56,7 +56,9 @@ typedef struct MemoryContextCallback
@@ -8942,7 +9296,7 @@ index c49ef6de..848f02d2 100644
  
  /*
   * Flags for MemoryContextAllocExtended.
-@@ -132,7 +134,7 @@ extern pg_nodiscard void *repalloc_huge(void *pointer, Size size);
+@@ -132,7 +134,7 @@ pg_nodiscard extern void *repalloc_huge(void *pointer, Size size);
   * it's necessary to hide the inline definition of MemoryContextSwitchTo in
   * this scenario; hence the #ifndef FRONTEND.
   */
@@ -8962,10 +9316,10 @@ index c49ef6de..848f02d2 100644
  extern void MemoryContextRegisterResetCallback(MemoryContext context,
  											   MemoryContextCallback *cb);
 diff --git a/src/interfaces/libpq/fe-auth.c b/src/interfaces/libpq/fe-auth.c
-index 3b25d8af..48989bca 100644
+index 84a0422..d8c9e54 100644
 --- a/src/interfaces/libpq/fe-auth.c
 +++ b/src/interfaces/libpq/fe-auth.c
-@@ -1169,6 +1169,7 @@ char *
+@@ -1286,6 +1286,7 @@ char *
  pg_fe_getusername(uid_t user_id, PQExpBuffer errorMessage)
  {
  	char	   *result = NULL;
@@ -8973,9 +9327,9 @@ index 3b25d8af..48989bca 100644
  	const char *name = NULL;
  
  #ifdef WIN32
-@@ -1192,7 +1193,9 @@ pg_fe_getusername(uid_t user_id, PQExpBuffer errorMessage)
- 	else if (errorMessage)
- 		appendPQExpBuffer(errorMessage, "%s\n", pwdbuf);
+@@ -1322,7 +1323,9 @@ pg_fe_getusername(uid_t user_id, PQExpBuffer errorMessage)
+ 	else
+ 		name = pw->pw_name;
  #endif
 -
 +#else
@@ -8985,10 +9339,10 @@ index 3b25d8af..48989bca 100644
  	{
  		result = strdup(name);
 diff --git a/src/interfaces/libpq/fe-connect.c b/src/interfaces/libpq/fe-connect.c
-index 5d390c1d..85fb508f 100644
+index e7770da..f86814e 100644
 --- a/src/interfaces/libpq/fe-connect.c
 +++ b/src/interfaces/libpq/fe-connect.c
-@@ -2034,7 +2034,8 @@ oom_error:
+@@ -2345,7 +2345,8 @@ oom_error:
  static int
  connectNoDelay(PGconn *conn)
  {
@@ -8998,7 +9352,7 @@ index 5d390c1d..85fb508f 100644
  	int			on = 1;
  
  	if (setsockopt(conn->sock, IPPROTO_TCP, TCP_NODELAY,
-@@ -2048,7 +2049,7 @@ connectNoDelay(PGconn *conn)
+@@ -2359,7 +2360,7 @@ connectNoDelay(PGconn *conn)
  		return 0;
  	}
  #endif
@@ -9007,7 +9361,7 @@ index 5d390c1d..85fb508f 100644
  	return 1;
  }
  
-@@ -2169,6 +2170,9 @@ connectFailureMessage(PGconn *conn, int errorno)
+@@ -2480,6 +2481,9 @@ connectFailureMessage(PGconn *conn, int errorno)
  static int
  useKeepalives(PGconn *conn)
  {
@@ -9017,7 +9371,7 @@ index 5d390c1d..85fb508f 100644
  	int			val;
  
  	if (conn->keepalives == NULL)
-@@ -2178,6 +2182,7 @@ useKeepalives(PGconn *conn)
+@@ -2489,6 +2493,7 @@ useKeepalives(PGconn *conn)
  		return -1;
  
  	return val != 0 ? 1 : 0;
@@ -9025,7 +9379,7 @@ index 5d390c1d..85fb508f 100644
  }
  
  #ifndef WIN32
-@@ -2404,13 +2409,14 @@ pqConnectDBStart(PGconn *conn)
+@@ -2715,13 +2720,14 @@ pqConnectDBStart(PGconn *conn)
  	 * Nobody but developers should see this message, so we don't bother
  	 * translating it.
  	 */
@@ -9041,7 +9395,7 @@ index 5d390c1d..85fb508f 100644
  	/* Ensure our buffers are empty */
  	conn->inStart = conn->inCursor = conn->inEnd = 0;
  	conn->outCount = 0;
-@@ -2496,7 +2502,7 @@ pqConnectDBComplete(PGconn *conn)
+@@ -2807,7 +2813,7 @@ pqConnectDBComplete(PGconn *conn)
  	for (;;)
  	{
  		int			ret = 0;
@@ -9050,7 +9404,7 @@ index 5d390c1d..85fb508f 100644
  		/*
  		 * (Re)start the connect_timeout timer if it's active and we are
  		 * considering a different host than we were last time through.  If
-@@ -2511,7 +2517,9 @@ pqConnectDBComplete(PGconn *conn)
+@@ -2822,7 +2828,9 @@ pqConnectDBComplete(PGconn *conn)
  			last_whichhost = conn->whichhost;
  			last_whichaddr = conn->whichaddr;
  		}
@@ -9061,7 +9415,7 @@ index 5d390c1d..85fb508f 100644
  		/*
  		 * Wait, if necessary.  Note that the initial state (just after
  		 * PQconnectStart) is to wait for the socket to select for writing.
-@@ -2522,6 +2530,7 @@ pqConnectDBComplete(PGconn *conn)
+@@ -2833,6 +2841,7 @@ pqConnectDBComplete(PGconn *conn)
  				return 1;		/* success! */
  
  			case PGRES_POLLING_READING:
@@ -9069,7 +9423,7 @@ index 5d390c1d..85fb508f 100644
  				ret = pqWaitTimed(1, 0, conn, end_time);
  				if (ret == -1)
  				{
-@@ -2529,9 +2538,11 @@ pqConnectDBComplete(PGconn *conn)
+@@ -2840,9 +2849,11 @@ pqConnectDBComplete(PGconn *conn)
  					conn->status = CONNECTION_BAD;
  					return 0;
  				}
@@ -9081,7 +9435,7 @@ index 5d390c1d..85fb508f 100644
  				ret = pqWaitTimed(0, 1, conn, end_time);
  				if (ret == -1)
  				{
-@@ -2539,9 +2550,11 @@ pqConnectDBComplete(PGconn *conn)
+@@ -2850,9 +2861,11 @@ pqConnectDBComplete(PGconn *conn)
  					conn->status = CONNECTION_BAD;
  					return 0;
  				}
@@ -9093,7 +9447,7 @@ index 5d390c1d..85fb508f 100644
  				/* Just in case we failed to set it in PQconnectPoll */
  				conn->status = CONNECTION_BAD;
  				return 0;
-@@ -2625,8 +2638,14 @@ PQconnectPoll(PGconn *conn)
+@@ -2936,8 +2949,14 @@ PQconnectPoll(PGconn *conn)
  		case CONNECTION_CHECK_STANDBY:
  			{
  				/* Load waiting data */
@@ -9110,7 +9464,7 @@ index 5d390c1d..85fb508f 100644
  				if (n < 0)
  					goto error_return;
  				if (n == 0)
-@@ -2669,6 +2688,7 @@ keep_going:						/* We will come back to here until there is
+@@ -2981,6 +3000,7 @@ keep_going:						/* We will come back to here until there is
  		conn->try_next_addr = false;
  	}
  
@@ -9118,7 +9472,7 @@ index 5d390c1d..85fb508f 100644
  	/* Time to advance to next connhost[] entry? */
  	if (conn->try_next_host)
  	{
-@@ -3219,7 +3239,7 @@ keep_going:						/* We will come back to here until there is
+@@ -3531,7 +3551,7 @@ keep_going:						/* We will come back to here until there is
  				 * Now check (using getsockopt) that there is not an error
  				 * state waiting for us on the socket.
  				 */
@@ -9127,7 +9481,7 @@ index 5d390c1d..85fb508f 100644
  				if (getsockopt(conn->sock, SOL_SOCKET, SO_ERROR,
  							   (char *) &optval, &optlen) == -1)
  				{
-@@ -3306,6 +3326,10 @@ keep_going:						/* We will come back to here until there is
+@@ -3618,6 +3638,10 @@ keep_going:						/* We will come back to here until there is
  				/*
  				 * Make sure we can write before advancing to next step.
  				 */
@@ -9138,7 +9492,7 @@ index 5d390c1d..85fb508f 100644
  				conn->status = CONNECTION_MADE;
  				return PGRES_POLLING_WRITING;
  			}
-@@ -3872,14 +3896,20 @@ keep_going:						/* We will come back to here until there is
+@@ -4184,6 +4208,12 @@ keep_going:						/* We will come back to here until there is
  				 * Note that conn->pghost must be non-NULL if we are going to
  				 * avoid the Kerberos code doing a hostname look-up.
  				 */
@@ -9148,20 +9502,18 @@ index 5d390c1d..85fb508f 100644
 +    conn->pghost = strdup("localhost");
 +}
 +#endif
- 				res = pg_fe_sendauth(areq, msgLength, conn);
+ 				res = pg_fe_sendauth(areq, msgLength, conn, &async);
  
- 				/* OK, we have processed the message; mark data consumed */
- 				conn->inStart = conn->inCursor;
+ 				if (async && (res == STATUS_OK))
+@@ -4217,7 +4247,6 @@ keep_going:						/* We will come back to here until there is
  
--				if (res != STATUS_OK)
-+				if (res != STATUS_OK) {
  					goto error_return;
+ 				}
 -
-+                }
  				/*
  				 * Just make sure that any data sent by pg_fe_sendauth is
  				 * flushed out.  Although this theoretically could block, it
-@@ -4273,7 +4303,6 @@ keep_going:						/* We will come back to here until there is
+@@ -4677,7 +4706,6 @@ keep_going:						/* We will come back to here until there is
  	/* Unreachable */
  
  error_return:
@@ -9170,10 +9522,10 @@ index 5d390c1d..85fb508f 100644
  	 * We used to close the socket at this point, but that makes it awkward
  	 * for those above us if they wish to remove this socket from their own
 diff --git a/src/interfaces/libpq/fe-misc.c b/src/interfaces/libpq/fe-misc.c
-index e7231d83..37618b94 100644
+index f93124b..1791985 100644
 --- a/src/interfaces/libpq/fe-misc.c
 +++ b/src/interfaces/libpq/fe-misc.c
-@@ -998,7 +998,11 @@ pqSendSome(PGconn *conn, int len)
+@@ -1013,7 +1013,11 @@ pqSendSome(PGconn *conn, int len)
  		int			sent;
  
  #ifndef WIN32
@@ -9185,7 +9537,7 @@ index e7231d83..37618b94 100644
  #else
  
  		/*
-@@ -1131,7 +1135,9 @@ pqFlush(PGconn *conn)
+@@ -1146,7 +1150,9 @@ pqFlush(PGconn *conn)
  
  		return pqSendSome(conn, conn->outCount);
  	}
@@ -9196,7 +9548,7 @@ index e7231d83..37618b94 100644
  	return 0;
  }
  
-@@ -1212,6 +1218,9 @@ pqWriteReady(PGconn *conn)
+@@ -1228,6 +1234,9 @@ pqWriteReady(PGconn *conn)
  static int
  pqSocketCheck(PGconn *conn, int forRead, int forWrite, pg_usec_time_t end_time)
  {
@@ -9204,9 +9556,9 @@ index e7231d83..37618b94 100644
 +    return 1;
 +#else
  	int			result;
+ 	pgsocket	sock;
  
- 	if (!conn)
-@@ -1243,6 +1252,7 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, pg_usec_time_t end_time)
+@@ -1267,6 +1276,7 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, pg_usec_time_t end_time)
  	}
  
  	return result;
@@ -9215,7 +9567,7 @@ index e7231d83..37618b94 100644
  
  
 diff --git a/src/interfaces/libpq/legacy-pqsignal.c b/src/interfaces/libpq/legacy-pqsignal.c
-index 6db349bc..9c69f389 100644
+index ebd1695..9201158 100644
 --- a/src/interfaces/libpq/legacy-pqsignal.c
 +++ b/src/interfaces/libpq/legacy-pqsignal.c
 @@ -36,8 +36,8 @@
@@ -9235,7 +9587,7 @@ index 6db349bc..9c69f389 100644
 +#endif /* __EMSCRIPTEN__ || __wasi__ */
 diff --git a/src/makefiles/Makefile.emscripten b/src/makefiles/Makefile.emscripten
 new file mode 100644
-index 00000000..3d37d043
+index 0000000..3d37d04
 --- /dev/null
 +++ b/src/makefiles/Makefile.emscripten
 @@ -0,0 +1,16 @@
@@ -9257,7 +9609,7 @@ index 00000000..3d37d043
 +	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
 diff --git a/src/makefiles/Makefile.wasi b/src/makefiles/Makefile.wasi
 new file mode 100644
-index 00000000..3d37d043
+index 0000000..3d37d04
 --- /dev/null
 +++ b/src/makefiles/Makefile.wasi
 @@ -0,0 +1,16 @@
@@ -9278,10 +9630,10 @@ index 00000000..3d37d043
 +%.so: %.o
 +	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
 diff --git a/src/port/getopt.c b/src/port/getopt.c
-index 3e101a72..32f388e8 100644
+index 2cca5a0..15a76b9 100644
 --- a/src/port/getopt.c
 +++ b/src/port/getopt.c
-@@ -67,8 +67,13 @@ char	   *optarg;				/* argument associated with option */
+@@ -68,8 +68,13 @@ char	   *optarg;				/* argument associated with option */
   * (Internally, this means we must be sure to reset "place" to EMSG before
   * returning -1.)
   */
@@ -9296,7 +9648,7 @@ index 3e101a72..32f388e8 100644
  	static char *place = EMSG;	/* option letter processing */
  	const char *oli;			/* option letter list index */
 diff --git a/src/port/getpeereid.c b/src/port/getpeereid.c
-index f1fef916..09f86bfc 100644
+index 3454785..3871317 100644
 --- a/src/port/getpeereid.c
 +++ b/src/port/getpeereid.c
 @@ -32,7 +32,11 @@
@@ -9313,11 +9665,11 @@ index f1fef916..09f86bfc 100644
  	struct ucred peercred;
  	socklen_t	so_len = sizeof(peercred);
 diff --git a/src/port/pqsignal.c b/src/port/pqsignal.c
-index 9dadce83..fa9317bc 100644
+index 2694384..1337e8c 100644
 --- a/src/port/pqsignal.c
 +++ b/src/port/pqsignal.c
-@@ -173,3 +173,14 @@ pqsignal(int signo, pqsigfunc func)
- 		return ret;
+@@ -151,3 +151,14 @@ pqsignal(int signo, pqsigfunc func)
+ 		Assert(false);			/* probably indicates coding error */
  #endif
  }
 +
@@ -9332,7 +9684,7 @@ index 9dadce83..fa9317bc 100644
 +#endif
 +
 diff --git a/src/port/pthread_barrier_wait.c b/src/port/pthread_barrier_wait.c
-index 835dbf1c..e9d45647 100644
+index 2387a2a..499c5e2 100644
 --- a/src/port/pthread_barrier_wait.c
 +++ b/src/port/pthread_barrier_wait.c
 @@ -14,7 +14,7 @@
@@ -9367,7 +9719,7 @@ index 835dbf1c..e9d45647 100644
 +
 diff --git a/src/template/emscripten b/src/template/emscripten
 new file mode 100644
-index 00000000..da36f9bf
+index 0000000..da36f9b
 --- /dev/null
 +++ b/src/template/emscripten
 @@ -0,0 +1,56 @@
@@ -9429,7 +9781,7 @@ index 00000000..da36f9bf
 +
 diff --git a/src/template/wasi b/src/template/wasi
 new file mode 100644
-index 00000000..dc3dc340
+index 0000000..dc3dc34
 --- /dev/null
 +++ b/src/template/wasi
 @@ -0,0 +1,28 @@
@@ -9462,10 +9814,10 @@ index 00000000..dc3dc340
 +CFLAGS_SL="-fPIC"
 +
 diff --git a/src/test/modules/libpq_pipeline/libpq_pipeline.c b/src/test/modules/libpq_pipeline/libpq_pipeline.c
-index ac4d2630..0809e67a 100644
+index 9a3c023..c416457 100644
 --- a/src/test/modules/libpq_pipeline/libpq_pipeline.c
 +++ b/src/test/modules/libpq_pipeline/libpq_pipeline.c
-@@ -334,7 +334,7 @@ test_cancel(PGconn *conn)
+@@ -333,7 +333,7 @@ test_cancel(PGconn *conn)
  			{
  				if (errno == EINTR)
  					continue;
@@ -9474,7 +9826,7 @@ index ac4d2630..0809e67a 100644
  			}
  			break;
  		}
-@@ -391,7 +391,7 @@ test_cancel(PGconn *conn)
+@@ -390,7 +390,7 @@ test_cancel(PGconn *conn)
  			{
  				if (errno == EINTR)
  					continue;
@@ -9483,7 +9835,7 @@ index ac4d2630..0809e67a 100644
  			}
  			break;
  		}
-@@ -643,7 +643,7 @@ test_nosync(PGconn *conn)
+@@ -642,7 +642,7 @@ test_nosync(PGconn *conn)
  		tv.tv_usec = 0;
  		if (select(sock + 1, &input_mask, NULL, NULL, &tv) < 0)
  		{
@@ -9492,7 +9844,7 @@ index ac4d2630..0809e67a 100644
  			exit_nicely(conn);
  		}
  		if (FD_ISSET(sock, &input_mask) && PQconsumeInput(conn) != 1)
-@@ -1094,7 +1094,7 @@ test_pipelined_insert(PGconn *conn, int n_rows)
+@@ -1093,7 +1093,7 @@ test_pipelined_insert(PGconn *conn, int n_rows)
  
  		if (select(sock + 1, &input_mask, &output_mask, NULL, NULL) < 0)
  		{
@@ -9501,7 +9853,7 @@ index ac4d2630..0809e67a 100644
  			exit_nicely(conn);
  		}
  
-@@ -2010,7 +2010,7 @@ test_uniqviol(PGconn *conn)
+@@ -2113,7 +2113,7 @@ test_uniqviol(PGconn *conn)
  		{
  			if (errno == EINTR)
  				continue;
@@ -9511,7 +9863,7 @@ index ac4d2630..0809e67a 100644
  
  		if (FD_ISSET(sock, &in_fds) && PQconsumeInput(conn) == 0)
 diff --git a/src/test/regress/GNUmakefile b/src/test/regress/GNUmakefile
-index 090e49ea..b6f20ef8 100644
+index ef2bddf..3fd7eab 100644
 --- a/src/test/regress/GNUmakefile
 +++ b/src/test/regress/GNUmakefile
 @@ -17,6 +17,14 @@ subdir = src/test/regress
@@ -9529,17 +9881,17 @@ index 090e49ea..b6f20ef8 100644
  # maximum simultaneous connections for parallel tests
  MAXCONNOPT =
  ifdef MAX_CONNECTIONS
-@@ -152,3 +160,5 @@ clean distclean: clean-lib
+@@ -132,3 +140,5 @@ clean distclean: clean-lib
  	rm -f pg_regress_main.o pg_regress.o pg_regress$(X)
  # things created by various check targets
  	rm -rf $(pg_regress_clean_files)
 +
 +endif
 diff --git a/src/test/regress/pg_regress.c b/src/test/regress/pg_regress.c
-index e695c4c6..623aa1ac 100644
+index 7862bb2..6b95c8a 100644
 --- a/src/test/regress/pg_regress.c
 +++ b/src/test/regress/pg_regress.c
-@@ -38,6 +38,15 @@
+@@ -37,6 +37,15 @@
  #include "pg_regress.h"
  #include "portability/instr_time.h"
  
@@ -9557,7 +9909,7 @@ index e695c4c6..623aa1ac 100644
  {
 diff --git a/wasm-build.sh b/wasm-build.sh
 new file mode 100755
-index 00000000..c0de2dc0
+index 0000000..c0de2dc
 --- /dev/null
 +++ b/wasm-build.sh
 @@ -0,0 +1,663 @@
@@ -10226,7 +10578,7 @@ index 00000000..c0de2dc0
 +
 diff --git a/wasm-build/build-ext.sh b/wasm-build/build-ext.sh
 new file mode 100755
-index 00000000..c8aa99d1
+index 0000000..c8aa99d
 --- /dev/null
 +++ b/wasm-build/build-ext.sh
 @@ -0,0 +1,137 @@
@@ -10369,7 +10721,7 @@ index 00000000..c8aa99d1
 +fi
 diff --git a/wasm-build/build-pgcore.sh b/wasm-build/build-pgcore.sh
 new file mode 100755
-index 00000000..702f481d
+index 0000000..702f481
 --- /dev/null
 +++ b/wasm-build/build-pgcore.sh
 @@ -0,0 +1,437 @@
@@ -10812,7 +11164,7 @@ index 00000000..702f481d
 +
 diff --git a/wasm-build/extension.sh b/wasm-build/extension.sh
 new file mode 100755
-index 00000000..db35aee7
+index 0000000..db35aee
 --- /dev/null
 +++ b/wasm-build/extension.sh
 @@ -0,0 +1,28 @@
@@ -10846,7 +11198,7 @@ index 00000000..db35aee7
 +
 diff --git a/wasm-build/getsyms.py b/wasm-build/getsyms.py
 new file mode 100755
-index 00000000..96c5b62d
+index 0000000..96c5b62
 --- /dev/null
 +++ b/wasm-build/getsyms.py
 @@ -0,0 +1,170 @@
@@ -11022,7 +11374,7 @@ index 00000000..96c5b62d
 +            print(f"_{rep}")
 diff --git a/wasm-build/linkexport.sh b/wasm-build/linkexport.sh
 new file mode 100755
-index 00000000..d40da330
+index 0000000..d40da33
 --- /dev/null
 +++ b/wasm-build/linkexport.sh
 @@ -0,0 +1,42 @@
@@ -11070,7 +11422,7 @@ index 00000000..d40da330
 +
 diff --git a/wasm-build/linkimports.sh b/wasm-build/linkimports.sh
 new file mode 100755
-index 00000000..4ab35b48
+index 0000000..4ab35b4
 --- /dev/null
 +++ b/wasm-build/linkimports.sh
 @@ -0,0 +1,152 @@
@@ -11228,7 +11580,7 @@ index 00000000..4ab35b48
 +echo "============= link imports : end ==============="
 diff --git a/wasm-build/pack_extension.py b/wasm-build/pack_extension.py
 new file mode 100644
-index 00000000..2a8d89a5
+index 0000000..2a8d89a
 --- /dev/null
 +++ b/wasm-build/pack_extension.py
 @@ -0,0 +1,154 @@
@@ -11388,7 +11740,7 @@ index 00000000..2a8d89a5
 +    print("Nothing to pack for builtin extension :", EXTNAME)
 diff --git a/wasm-build/reqsym.py b/wasm-build/reqsym.py
 new file mode 100644
-index 00000000..d59e1851
+index 0000000..d59e185
 --- /dev/null
 +++ b/wasm-build/reqsym.py
 @@ -0,0 +1,27 @@
@@ -11421,7 +11773,7 @@ index 00000000..d59e1851
 +""")
 diff --git a/wasm-build/sdk.sh b/wasm-build/sdk.sh
 new file mode 100755
-index 00000000..d0298734
+index 0000000..d029873
 --- /dev/null
 +++ b/wasm-build/sdk.sh
 @@ -0,0 +1,152 @@
@@ -11579,7 +11931,7 @@ index 00000000..d0298734
 +
 diff --git a/wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c b/wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c
 new file mode 100644
-index 00000000..44dac9e5
+index 0000000..44dac9e
 --- /dev/null
 +++ b/wasm-build/sdk_port-wasi/sdk_port-wasi-dlfcn.c
 @@ -0,0 +1,198 @@
@@ -11680,7 +12032,7 @@ index 00000000..44dac9e5
 +    return (char *)dlerror;
 +}
 +
-+static const Pg_magic_struct Pg_magic_data = PG_MODULE_MAGIC_DATA;
++static const Pg_magic_struct Pg_magic_data = PG_MODULE_MAGIC_DATA(.name = NULL);
 +
 +const Pg_magic_struct *
 +STUB_Pg_magic_func(void) {
@@ -11783,7 +12135,7 @@ index 00000000..44dac9e5
 +
 diff --git a/wasm-build/sdk_port-wasi/sdk_port-wasi.c b/wasm-build/sdk_port-wasi/sdk_port-wasi.c
 new file mode 100644
-index 00000000..5dbab909
+index 0000000..5dbab90
 --- /dev/null
 +++ b/wasm-build/sdk_port-wasi/sdk_port-wasi.c
 @@ -0,0 +1,509 @@
@@ -12298,10 +12650,10 @@ index 00000000..5dbab909
 +#endif // __wasi__p2
 diff --git a/wasm-build/sdk_port.h b/wasm-build/sdk_port.h
 new file mode 100644
-index 00000000..2ceab50b
+index 0000000..2ceab50
 --- /dev/null
 +++ b/wasm-build/sdk_port.h
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,267 @@
 +#if defined(__EMSCRIPTEN__)
 +#include <emscripten.h>
 +
@@ -12417,6 +12769,11 @@ index 00000000..2ceab50b
 +};
 +static int
 +getrlimit(int resource, struct rlimit *rlim) {
++    return -1;
++}
++
++static int
++setrlimit(int resource, const struct rlimit *rlim) {
 +    return -1;
 +}
 +

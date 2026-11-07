@@ -11,12 +11,12 @@ use std::{
 
 /// Bundled PostgreSQL version this component was built against.
 ///
-/// Must stay in sync with the engine source (`POSTGRES_SOURCE_TAG=REL_17_11`
+/// Must stay in sync with the engine source (`POSTGRES_SOURCE_TAG=REL_18_6`
 /// in `scripts/tool-versions.env`), which `server_version()` in `lib.rs`
-/// reports. The smoke consumer asserts `version.contains("17.11")`.
-pub(crate) const POSTGRES_VERSION: &str = "17.11";
+/// reports. The smoke consumer asserts `version.contains("18.6")`.
+pub(crate) const POSTGRES_VERSION: &str = "18.6";
 /// Major version recorded in `PG_VERSION` for a compatible data directory.
-const POSTGRES_MAJOR: &str = "17";
+const POSTGRES_MAJOR: &str = "18";
 
 /// Database that holds application data in data directories this provider
 /// initializes (#212).
@@ -540,9 +540,10 @@ fn start_serving(root: &Path, session: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// README section that explains moving a database between major versions.
+/// README section and migration script that explain moving a database from PostgreSQL 17 to 18 (#401).
 const MAJOR_UPGRADE_DOCS: &str =
-    "platform/pglite-component/README.md#upgrading-across-postgresql-major-versions";
+    "platform/pglite-component/README.md#migrating-from-postgresql-17-to-18 \
+     (or run `bun platform/pglite-component/scripts/migrate-17-to-18.ts`)";
 
 /// Refuse a data directory written by another PostgreSQL major version.
 ///
@@ -738,19 +739,27 @@ mod tests {
 
     #[test]
     fn data_version_must_match_the_bundled_major() {
-        assert_eq!(POSTGRES_VERSION, "17.11");
+        assert_eq!(POSTGRES_VERSION, "18.6");
         assert_eq!(check_data_version(POSTGRES_MAJOR), Ok(()));
-        assert_eq!(check_data_version("17\n"), Ok(()));
+        assert_eq!(check_data_version("18\n"), Ok(()));
 
-        let err = check_data_version("16\n").unwrap_err();
+        let err = check_data_version("17\n").unwrap_err();
         assert_eq!(
             err,
-            "incompatible PostgreSQL data directory: PG_VERSION is 16, but this provider \
-             bundles PostgreSQL 17.11 and opens only major version 17 data directories; \
-             see platform/pglite-component/README.md#upgrading-across-postgresql-major-versions"
+            "incompatible PostgreSQL data directory: PG_VERSION is 17, but this provider \
+             bundles PostgreSQL 18.6 and opens only major version 18 data directories; \
+             see platform/pglite-component/README.md#migrating-from-postgresql-17-to-18 \
+             (or run `bun platform/pglite-component/scripts/migrate-17-to-18.ts`)"
         );
-        assert!(check_data_version("18").unwrap_err().contains("PG_VERSION is 18,"));
-        assert!(check_data_version("  ").unwrap_err().contains("PG_VERSION is (empty),"));
+        assert!(check_data_version("16")
+            .unwrap_err()
+            .contains("PG_VERSION is 16,"));
+        assert!(check_data_version("19")
+            .unwrap_err()
+            .contains("PG_VERSION is 19,"));
+        assert!(check_data_version("  ")
+            .unwrap_err()
+            .contains("PG_VERSION is (empty),"));
     }
 
     #[test]

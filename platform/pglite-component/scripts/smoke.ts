@@ -8,6 +8,7 @@ import { type Context, logger, run } from './lib/cli.ts';
 import { fetchVerified } from './lib/fetch.ts';
 import { fileExists } from './lib/fs.ts';
 import { type Pins, requiredPin } from './lib/versions.ts';
+import { migrateCluster17To18 } from './migrate-17-to-18.ts';
 
 const log = logger('smoke');
 
@@ -19,6 +20,7 @@ const MARKERS = {
   'corrupt-write': 'corrupt-write ok',
   'corrupt-read': 'corrupt-read ok',
   'upgrade-write': 'upgrade write ok',
+  'upgrade-refused': 'upgrade refused ok',
   'upgrade-read': 'upgrade read ok',
   database: 'database ok',
   'missing-database': 'missing database ok',
@@ -162,9 +164,17 @@ async function previousProvider(release: PreviousRelease, dir: string): Promise<
 }
 
 /**
- * Cross-version step (#383): the previous release (PostgreSQL 17.5) writes a
- * data directory with a table, pgcrypto and PGP ciphertext; this build must
- * open it, read the data, and run pgcrypto on old and new values.
+ * Cross-version step (#383, #401):
+ * 1. The previous release (PostgreSQL 17.5) writes a data directory with a
+ *    table, pgcrypto, PGP ciphertext, and a plpgsql function.
+ * 2. Path 1 (clear error on unmigrated 17 directory): opening that PG 17
+ *    directory under the PG 18.6 provider fails cleanly with `open-failed`
+ *    pointing to `README.md#migrating-from-postgresql-17-to-18` and
+ *    `scripts/migrate-17-to-18.ts`.
+ * 3. Path 2 (documented export/import migration): `migrateCluster17To18`
+ *    exports the PG 17 cluster to SQL and imports it into a fresh PG 18
+ *    directory, and `upgrade-read` verifies the migrated objects, PGP
+ *    decryption, `data_checksums = on`, and writability under PG 18.6.
  */
 async function upgradeSmoke(ctx: Context, consumer: string, composed: string, smokeDir: string) {
   const release = previousRelease(ctx.tools.pins);
@@ -177,47 +187,65 @@ async function upgradeSmoke(ctx: Context, consumer: string, composed: string, sm
     provider: await previousProvider(release, upgradeDir),
   });
 
-  const dataDir = await mkdtemp(join(tmpdir(), 'df-pglite-upgrade.'));
-  const mount = ['--dir', `${dataDir}::/data`];
+  const dataDir17 = await mkdtemp(join(tmpdir(), 'df-pglite-upgrade17.'));
+  const dataDir18 = await mkdtemp(join(tmpdir(), 'df-pglite-upgrade18.'));
+  const mount17 = ['--dir', `${dataDir17}::/data`];
+  const mount18 = ['--dir', `${dataDir18}::/data`];
   try {
     await runMode(
       ctx,
       previous,
       smokeDir,
       'upgrade-write',
-      [...mount, '--env', `PGLITE_SMOKE_SERVER_VERSION=${release.postgres}`],
+      [...mount17, '--env', `PGLITE_SMOKE_SERVER_VERSION=${release.postgres}`],
       `upgrade-write-${release.version}`,
     );
-    const pgVersion = (await Bun.file(join(dataDir, 'pglite', 'data', 'PG_VERSION')).text()).trim();
+    const pgVersion = (
+      await Bun.file(join(dataDir17, 'pglite', 'data', 'PG_VERSION')).text()
+    ).trim();
     checkPreviousPgVersion(pgVersion, release);
-    await expectMarker(dataDir, null, `after ${release.version}`);
-    // upgrade-read asserts that `none` still selects template1 here (#212).
-    await runMode(ctx, composed, smokeDir, 'upgrade-read', mount);
-    await expectMarker(dataDir, null, 'legacy directory after upgrade-read');
-    const table = 'upgrade_check';
-    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-explicit-postgres', {
-      requested: 'postgres',
-      expected: 'postgres',
-      table,
-      present: false,
+    await expectMarker(dataDir17, null, `after ${release.version}`);
+
+    // Path 1 (#401): opening an unmigrated PG 17 directory fails cleanly with a clear error.
+    await runMode(ctx, composed, smokeDir, 'upgrade-refused', mount17);
+    await expectMarker(dataDir17, null, 'unmigrated 17 directory after refusal');
+
+    // Path 2 (#401): logical export from PG 17 and import into a fresh PG 18 cluster.
+    await migrateCluster17To18(ctx, {
+      fromDir: dataDir17,
+      toDir: dataDir18,
+      previousComposed: previous,
+      currentComposed: composed,
+      workDir: upgradeDir,
+      fromServerVersion: release.postgres,
     });
-    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-explicit-template1', {
+    await expectMarker(dataDir18, 'postgres\n', 'migrated PG 18 directory');
+    await runMode(ctx, composed, smokeDir, 'upgrade-read', mount18);
+    const table = 'upgrade_check';
+    await databaseCheck(ctx, composed, smokeDir, mount18, 'migrated-explicit-template1', {
       requested: 'template1',
       expected: 'template1',
       table,
-      present: true,
+      present: false,
     });
-    await databaseCheck(ctx, composed, smokeDir, mount, 'legacy-default', {
-      expected: 'template1',
+    await databaseCheck(ctx, composed, smokeDir, mount18, 'migrated-explicit-postgres', {
+      requested: 'postgres',
+      expected: 'postgres',
       table,
       present: true,
     });
-    await expectMarker(dataDir, null, 'legacy directory after explicit opens');
+    await databaseCheck(ctx, composed, smokeDir, mount18, 'migrated-default', {
+      expected: 'postgres',
+      table,
+      present: true,
+    });
+    await expectMarker(dataDir18, 'postgres\n', 'migrated directory after explicit opens');
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
+    await rm(dataDir17, { recursive: true, force: true });
+    await rm(dataDir18, { recursive: true, force: true });
   }
   log(
-    `data directory from ${release.version} (PostgreSQL ${release.postgres}) opens under this build`,
+    `data directory from ${release.version} (PostgreSQL ${release.postgres}) refused in-place and migrated cleanly to PostgreSQL 18.6`,
   );
 }
 
