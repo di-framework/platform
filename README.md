@@ -23,7 +23,7 @@ Full guides for operating and developing on the platform live in [`docs/`](docs/
 | --- | --- | --- |
 | [`platform/platform`](platform/platform/README.md) | `@di-framework/platform` | Cluster install: Pulumi, CRDs, controller, tenancy, backing services |
 | [`platform/bindings`](platform/bindings/README.md) | `@di-framework/bindings` | Application guest bindings and workload metadata |
-| [`platform/pglite-component`](platform/pglite-component/README.md) | `@di-framework/pglite-component` | Embedded Wasm PostgreSQL provider (`di-framework:postgres-query@0.1.0`) |
+| [`platform/pglite-component`](platform/pglite-component/README.md) | `@di-framework/pglite-component` | Embedded Wasm PostgreSQL provider (`di-framework:pglite/database@0.2.0`) |
 | [`platform/pglite-encfs`](platform/pglite-encfs/README.md) | `@di-framework/pglite-encfs` | Encrypted WASI filesystem layer for PGlite |
 | [`platform/sqlite-component`](platform/sqlite-component/README.md) | `@di-framework/sqlite-component` | `di-framework:sqlite@0.1.0` provider component |
 | [`platform/tenant-auth`](platform/tenant-auth/README.md) | `@di-framework/tenant-auth` | Per-tenant identity server, OAuth2/API keys, and `/v1` controller auth |

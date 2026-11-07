@@ -103,7 +103,7 @@ Configure embedded PostgreSQL in `di-framework.config.json` under the `"pglite"`
 | `pglite.wasm` | None | Local `.wasm` file path inside the project for offline component development (or `DI_FRAMEWORK_PGLITE_WASM` env override). Refused by `platform deploy` and in CI unless `DI_FRAMEWORK_ALLOW_LOCAL_PGLITE=1` is set. |
 | `pglite.storageMount` | `"/data"` | Mounted WASI filesystem preopen path (resolved against `wasmcloud.storage.mounts`; tenant targets accept `/data` or `/data/actors`). |
 | `pglite.dataDir` | `"<storageMount>/pglite"` (`/data/pglite`) | Database root directory under `storageMount`, injected into the guest environment as `DI_PGLITE_DATA_DIR`. Setting a conflicting user `wasmcloud.env.DI_PGLITE_DATA_DIR` or configuring two workload members that resolve to the same database root fails with `WASMCLOUD_PGLITE_DATA_DIR_CONFLICT`. |
-| `pglite.encryption` | None | Optional `@di-framework/pglite-encfs` configuration (`{ "image": "ghcr.io/di-framework/pglite-encfs@sha256:..." }` or local `wasm`); see [Encryption at Rest](#encryption-at-rest). |
+| `pglite.encryption` | None | Optional `@di-framework/pglite-encfs` configuration (`{ "image": "ghcr.io/di-framework/pglite-encfs@sha256:..." }` or local `wasm`); see [Encryption at Rest](#encryption-at-rest-di-frameworkpglite-encfs). |
 
 ### Build and Composition Pipeline
 

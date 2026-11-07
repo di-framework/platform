@@ -42,7 +42,7 @@ is refused on the `vcluster` target by an XValidation CEL rule.
 | `version` | string | yes | | pattern `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` | Exact `@di-framework/platform` package version to install, for example `6.0.30`. Ranges are not accepted. When `spec.version` matches the operator image's baked default (`6.0.30` in `v6.0.30`), `pulumi up` runs from the image's pre-installed package and plugin cache without outbound npm or Pulumi plugin downloads; see [Outbound traffic](platform-operator.md#outbound-traffic). |
 | `target.type` | string | yes | | enum `vcluster`; immutable (`target is immutable`) | Target kind (mode). Only `vcluster` is supported in v1alpha1. With `vcluster`, new `PlatformInstance` objects cannot set `spec.platform.networkPolicyEngine: kube-router` (`vcluster` instances use `existing`, enforced by the host cluster's CNI). |
 | `deletionPolicy` | string | | `Delete` | enum `Delete`, `Retain` | What deleting the instance does. See [Delete and Retain](platform-operator-operations.md#delete-and-retain). |
-| `platform` | object | | | see [spec.platform](#spec-platform) | Platform settings the operator passes to the install. |
+| `platform` | object | | | see [spec.platform](#specplatform) | Platform settings the operator passes to the install. |
 
 ## spec.platform
 
@@ -56,9 +56,9 @@ CEL transition rule on `spec` rejects `networkPolicyEngine: kube-router` on `vcl
 | `storageRoot` | string | operator default `<storageRootBase>/<namespace>/<name>` | immutable (`platform.storageRoot is immutable`) | Node path under which the platform keeps tenant data. Empty uses the operator's per-instance default, which `deletionPolicy: Delete` removes. A path set here is never removed by the operator. |
 | `gateway.httpNodePort` | int32 | `0` | 0-32767 | Publishes the gateway on this NodePort. Zero keeps it ClusterIP. |
 | `gateway.httpEndpoint` | string | | pattern `^https?://` | Gateway's public base URL, for example `http://apps.example:30080`. The platform derives route URLs from it, and `status.endpoints.http` reports it. |
-| `tenants[]` | array | | at most 32; map list keyed by `name` | The platform's `tenants`. See [tenants](#spec-platform-tenants). |
-| `users[]` | array | | at most 128; map list keyed by `name` | The platform's `users` and their memberships. See [users](#spec-platform-users). |
-| `tenantAuth` | object | | see [tenantAuth](#spec-platform-tenantauth) | Enables the per-tenant console and `/v1` API against an OIDC issuer. Unset, tenants get no console. |
+| `tenants[]` | array | | at most 32; map list keyed by `name` | The platform's `tenants`. See [tenants](#tenants). |
+| `users[]` | array | | at most 128; map list keyed by `name` | The platform's `users` and their memberships. See [users](#users). |
+| `tenantAuth` | object | | see [tenantAuth](#tenantauth) | Enables the per-tenant console and `/v1` API against an OIDC issuer. Unset, tenants get no console. |
 | `tenantHostImage` | string | the recorded `status.applied.tenantHostImage` | max 512; pattern `^[^\s@]+(@sha256:[0-9a-f]{64})?$` | The platform's `tenantHostImage`. A change is applied by the next install and restarts the tenant hosts. Empty keeps the recorded image. A new instance records the operator's pinned exclusive host variant (`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` by digest), which the `spec.version` package must list as an approved host build. An instance installed before this field existed keeps the platform's own default. |
 | `tenantHostImagePullPolicy` | string | the platform's default, `IfNotPresent` | enum `Always`, `IfNotPresent`, `Never` | The platform's `tenantHostImagePullPolicy`. |
 
@@ -131,9 +131,9 @@ that Secret. The value never reaches the CR, its status, events or the operator 
 | `endpoints.kubernetes` | string | The instance's Kubernetes endpoint, from the install's outputs. |
 | `endpoints.http` | string | The gateway's public base URL, from the install's outputs (`spec.platform.gateway.httpEndpoint`). |
 | `kubeconfigSecretRef.name` | string | Secret in the PlatformInstance's namespace holding the instance's admin kubeconfig under the key `kubeconfig` (`<name>-kubeconfig`). Kept while that Secret exists. |
-| `applied` | object | What the last successful install applied. See [status.applied](#status-applied). |
+| `applied` | object | What the last successful install applied. See [status.applied](#statusapplied). |
 | `lastRepair` | date-time | When the last periodic refresh and up finished. |
-| `target` | object | What the operator recorded about the target cluster. See [status.target](#status-target). |
+| `target` | object | What the operator recorded about the target cluster. See [status.target](#statustarget). |
 | `conditions[]` | array | Standard `metav1.Condition` entries keyed by `type`, each with `status`, `reason`, `message`, `lastTransitionTime` and `observedGeneration`. See [Conditions](#conditions). |
 
 ### status.applied
