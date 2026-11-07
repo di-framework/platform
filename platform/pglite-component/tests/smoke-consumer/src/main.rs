@@ -35,7 +35,7 @@ fn main() {
     // --- server version: proves the handshake (startup + auth + ReadyForQuery) ---
     // The cross-version step runs `upgrade-write` against the previous release.
     let expected =
-        std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "17.11".into());
+        std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "18.6".into());
     let version = server_version().expect("server-version");
     assert!(
         version.contains(&expected),
@@ -99,6 +99,21 @@ fn main() {
         println!("missing database ok");
         return;
     }
+    if mode == "upgrade-refused" {
+        upgrade_refused_mode();
+        println!("upgrade refused ok");
+        return;
+    }
+    if mode == "export-sql" {
+        export_sql_mode();
+        println!("export sql ok");
+        return;
+    }
+    if mode == "import-sql" {
+        import_sql_mode();
+        println!("import sql ok");
+        return;
+    }
     let db: Connection = open("/data/pglite", None).expect("open");
     assert!(matches!(
         open("/data/pglite", None),
@@ -108,7 +123,7 @@ fn main() {
     // initialized (the very first session included), `template1` for one
     // written by an earlier release. The previous release reports template1.
     let expected_db = match mode.as_str() {
-        "upgrade-write" | "upgrade-read" => "template1",
+        "upgrade-write" => "template1",
         _ => "postgres",
     };
     assert_eq!(
@@ -657,7 +672,7 @@ const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785
 const UPGRADE_SECRET: &str = "written by the previous release";
 
 /// Run by the previous release (PostgreSQL 17.5) on a fresh data directory:
-/// a table, pgcrypto, and PGP ciphertext for the new engine to read back.
+/// a table, pgcrypto, PGP ciphertext, and a plpgsql function to migrate to 18.6.
 fn upgrade_write(db: &Connection) {
     db.exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         .expect("CREATE EXTENSION pgcrypto");
@@ -671,17 +686,184 @@ fn upgrade_write(db: &Connection) {
         ],
     )
     .expect("insert upgrade_check");
+    db.exec(
+        "CREATE FUNCTION upgrade_greeting(name text) RETURNS text \
+         LANGUAGE plpgsql AS $$ BEGIN RETURN 'hello ' || name; END $$",
+    )
+    .expect("create upgrade_greeting");
 }
 
-/// Run by this release on the directory upgrade_write left: the engine is
-/// 17.11, the data is intact, and pgcrypto works on old and new data.
+/// Path 1 (#401): opening an unmigrated PostgreSQL 17 data directory under the
+/// PostgreSQL 18.6 provider fails cleanly with `Error::OpenFailed` naming the
+/// version mismatch and pointing to the documented migration guide and script.
+fn upgrade_refused_mode() {
+    match open("/data/pglite", None) {
+        Err(Error::OpenFailed(message)) => {
+            assert!(
+                message.contains(
+                    "incompatible PostgreSQL data directory: PG_VERSION is 17, \
+                     but this provider bundles PostgreSQL 18.6 and opens only \
+                     major version 18 data directories"
+                ),
+                "unexpected version mismatch message: {message}"
+            );
+            assert!(
+                message.contains("platform/pglite-component/README.md#migrating-from-postgresql-17-to-18"),
+                "missing README migration anchor: {message}"
+            );
+            assert!(
+                message.contains("scripts/migrate-17-to-18.ts"),
+                "missing migration script pointer: {message}"
+            );
+        }
+        Err(other) => panic!("expected OpenFailed on PG 17 directory, got {other:?}"),
+        Ok(_) => panic!("opening an unmigrated PG 17 directory under PG 18.6 must fail"),
+    }
+}
+
+/// Logical SQL export for 17 -> 18 migration (`scripts/migrate-17-to-18.ts`).
+fn export_sql_mode() {
+    let dump_path =
+        std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
+    let db = open("/data/pglite", None).expect("open source cluster for export");
+    let mut out = String::from("-- di-framework:pglite logical export\n");
+
+    let exts = db
+        .query(
+            "SELECT format('CREATE EXTENSION IF NOT EXISTS %I;', extname) AS stmt \
+             FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname",
+            &[],
+        )
+        .expect("query extensions");
+    for row in exts {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    let tables = db
+        .query(
+            "SELECT c.oid::int8 AS oid, c.relname AS relname, \
+                    format('CREATE TABLE public.%I (%s);', \
+                      c.relname, \
+                      concat_ws(', ', \
+                        (SELECT string_agg( \
+                           format('%I %s%s%s', \
+                             a.attname, \
+                             format_type(a.atttypid, a.atttypmod), \
+                             CASE WHEN ad.adbin IS NOT NULL THEN ' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid) ELSE '' END, \
+                             CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END \
+                           ), \
+                           ', ' ORDER BY a.attnum \
+                         ) \
+                         FROM pg_attribute a \
+                         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+                         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped), \
+                        (SELECT string_agg( \
+                           format('CONSTRAINT %I %s', con.conname, pg_get_constraintdef(con.oid)), \
+                           ', ' ORDER BY con.conname \
+                         ) \
+                         FROM pg_constraint con \
+                         WHERE con.conrelid = c.oid AND con.contype IN ('p', 'u', 'c')) \
+                      ) \
+                    ) AS ddl \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND c.relkind = 'r' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY c.relname",
+            &[],
+        )
+        .expect("query tables");
+    for table in tables {
+        let oid = int(col(&table, "oid"));
+        let relname = text(col(&table, "relname"));
+        let ddl = text(col(&table, "ddl"));
+        out.push_str(&ddl);
+        out.push('\n');
+
+        let row_query_row = db
+            .first(
+                "SELECT format( \
+                   'SELECT ''INSERT INTO public.%I (%s) VALUES ('' || %s || '');'' AS stmt FROM public.%I', \
+                   $1::text, \
+                   string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum), \
+                   string_agg( \
+                     format( \
+                       'COALESCE(quote_literal(%I::text) || %L, ''NULL'')', \
+                       a.attname, \
+                       '::' || format_type(a.atttypid, a.atttypmod) \
+                     ), \
+                     ' || '', '' || ' ORDER BY a.attnum \
+                   ), \
+                   $1::text \
+                 ) AS row_query \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = $2::int8::oid AND a.attnum > 0 AND NOT a.attisdropped",
+                &[Value::Text(relname), Value::Integer(oid)],
+            )
+            .expect("build row export query")
+            .expect("row export query");
+        let row_query = text(col(&row_query_row, "row_query"));
+        for ins in db.query(&row_query, &[]).expect("export table rows") {
+            out.push_str(&text(col(&ins, "stmt")));
+            out.push('\n');
+        }
+    }
+
+    let funcs = db
+        .query(
+            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY p.proname, p.oid",
+            &[],
+        )
+        .expect("query functions");
+    for row in funcs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    db.close().expect("close export-sql");
+    std::fs::write(&dump_path, out).expect("write exported SQL dump");
+}
+
+/// Logical SQL import into a fresh PostgreSQL 18 cluster (`scripts/migrate-17-to-18.ts`).
+fn import_sql_mode() {
+    let dump_path =
+        std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
+    let sql = std::fs::read_to_string(&dump_path).expect("read exported SQL dump");
+    let db = open("/data/pglite", None).expect("open target cluster for import");
+    db.begin().expect("begin import transaction");
+    db.exec(&sql).expect("execute imported SQL dump");
+    db.commit().expect("commit import transaction");
+    db.exec("CHECKPOINT").expect("checkpoint imported cluster");
+    db.close().expect("close import-sql");
+}
+
+/// Run by this release on the directory migrated from `upgrade_write`: the
+/// engine is 18.6, checksums are enabled, the data and functions are intact,
+/// and pgcrypto works on old and new data.
 fn upgrade_read(db: &Connection) {
     let row = db
         .first("SHOW server_version", &[])
         .expect("server_version")
         .expect("server_version row");
     let engine = text(&row[0].1);
-    assert!(engine.starts_with("17.11"), "engine reports {engine:?}");
+    assert!(engine.starts_with("18.6"), "engine reports {engine:?}");
+    assert_eq!(
+        first_text(db, "SHOW data_checksums", &[]),
+        "on",
+        "migrated PG 18 cluster must have data_checksums on"
+    );
 
     let row = db
         .first(
@@ -692,8 +874,12 @@ fn upgrade_read(db: &Connection) {
         .expect("upgrade_check row");
     assert_eq!(text(col(&row, "payload")), "kept across the upgrade");
     assert_eq!(text(col(&row, "secret")), UPGRADE_SECRET);
+    assert_eq!(
+        first_text(db, "SELECT upgrade_greeting('pg18') AS g", &[]),
+        "hello pg18"
+    );
 
-    // The extension created by 17.5 resolves its functions in 17.11.
+    // The extension migrated from 17.5 resolves its functions in 18.6.
     assert_eq!(
         first_text(db, "SELECT encode(digest('a', 'sha256'), 'hex') AS v", &[]),
         SHA256_A
@@ -706,7 +892,7 @@ fn upgrade_read(db: &Connection) {
         ),
         "fresh"
     );
-    // Upstream's refusal (CVE-2026-14663) holds in the upgraded directory.
+    // Upstream's refusal (CVE-2026-14663) holds in the migrated directory.
     let refused = db.first("SELECT pgp_sym_encrypt('x', 'k', 'cipher-algo=bf')", &[]);
     assert!(
         matches!(&refused, Err(Error::ExecutionFailed(e)) if e.message.contains("Cipher cannot be initialized")),
@@ -714,7 +900,7 @@ fn upgrade_read(db: &Connection) {
     );
     // And the directory stays writable.
     db.run(
-        "INSERT INTO upgrade_check VALUES (2, 'written by 17.11', NULL)",
+        "INSERT INTO upgrade_check VALUES (2, 'written by 18.6', NULL)",
         &[],
     )
     .expect("insert after upgrade");
