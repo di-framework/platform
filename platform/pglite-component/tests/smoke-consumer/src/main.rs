@@ -708,6 +708,11 @@ fn upgrade_write(db: &Connection) {
     )
     .expect("create upgrade_greeting");
     db.exec(
+        "CREATE FUNCTION upgrade_item_by_id(target_id int) RETURNS SETOF upgrade_items \
+         LANGUAGE sql STABLE AS $$ SELECT * FROM upgrade_items WHERE id = target_id $$",
+    )
+    .expect("create upgrade_item_by_id");
+    db.exec(
         "CREATE INDEX upgrade_items_label_idx ON upgrade_items (label, (upgrade_greeting(label)))",
     )
     .expect("create upgrade_items_label_idx");
@@ -903,24 +908,40 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
-    // Export user-defined functions before tables, indexes, and views so column
-    // defaults, CHECK constraints, generated columns, expression indexes, and views
-    // can reference them (`check_function_bodies` is disabled above).
-    let funcs = db
+    // Early function pass: export string-bodied user functions whose parameter and
+    // return types do not reference any `public` relation composite/array type so
+    // table column DEFAULTs, CHECK constraints, and generated columns can call them.
+    let early_funcs = db
         .query(
             "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE n.nspname = 'public' \
                AND p.prokind = 'f' \
+               AND p.prosqlbody IS NULL \
                AND NOT EXISTS ( \
                  SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+               AND NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM pg_type t \
+                 JOIN pg_class rc ON rc.oid = t.typrelid \
+                 JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                 WHERE rn.nspname = 'public' \
+                   AND ( \
+                     t.oid = p.prorettype \
+                     OR t.typarray = p.prorettype \
+                     OR t.oid = ANY(p.proargtypes::oid[]) \
+                     OR t.typarray = ANY(p.proargtypes::oid[]) \
+                     OR t.oid = ANY(COALESCE(p.proallargtypes, '{}')) \
+                     OR t.typarray = ANY(COALESCE(p.proallargtypes, '{}')) \
+                   ) \
                ) \
              ORDER BY p.proname, p.oid",
             &[],
         )
-        .expect("query functions");
-    for row in funcs {
+        .expect("query early functions");
+    for row in early_funcs {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
     }
@@ -1056,6 +1077,47 @@ fn export_sql_mode() {
         out.push_str(&text(col(&row, "stmt")));
         out.push('\n');
     }
+
+    // Late function pass: export SQL-standard (`BEGIN ATOMIC`) functions and functions
+    // whose parameter or return types reference `public` relation composite/array types,
+    // after tables exist and before standalone indexes and views.
+    let late_funcs = db
+        .query(
+            "SELECT pg_get_functiondef(p.oid) || ';' AS stmt \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' \
+               AND p.prokind = 'f' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+               AND ( \
+                 p.prosqlbody IS NOT NULL \
+                 OR EXISTS ( \
+                   SELECT 1 \
+                   FROM pg_type t \
+                   JOIN pg_class rc ON rc.oid = t.typrelid \
+                   JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                   WHERE rn.nspname = 'public' \
+                     AND ( \
+                       t.oid = p.prorettype \
+                       OR t.typarray = p.prorettype \
+                       OR t.oid = ANY(p.proargtypes::oid[]) \
+                       OR t.typarray = ANY(p.proargtypes::oid[]) \
+                       OR t.oid = ANY(COALESCE(p.proallargtypes, '{}')) \
+                       OR t.typarray = ANY(COALESCE(p.proallargtypes, '{}')) \
+                     ) \
+                 ) \
+               ) \
+             ORDER BY p.proname, p.oid",
+            &[],
+        )
+        .expect("query late functions");
+    for row in late_funcs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+    out.push_str("SET check_function_bodies = true;\n");
 
     // Standalone indexes not backing a constraint.
     let idxs = db
@@ -1242,6 +1304,10 @@ fn upgrade_read(db: &Connection) {
             &[]
         ),
         "ITEM-TWO"
+    );
+    assert_eq!(
+        first_text(db, "SELECT upper_label FROM upgrade_item_by_id(1)", &[]),
+        "ITEM-ONE"
     );
 
     // The extension migrated from 17.5 resolves its functions in 18.6.
