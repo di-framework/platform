@@ -13,7 +13,7 @@ __attribute__((export_name("di_reply_reset")))
 void di_reply_reset(void) { di_reply_size = 0; }
 
 static int
-internal_putbytes(const char *s, size_t len)
+internal_putbytes(const void *s, size_t len)
 {
     if (sockfiles) {
         int written = fwrite(s, 1, len, SOCKET_FILE);

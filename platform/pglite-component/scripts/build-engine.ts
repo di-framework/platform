@@ -10,11 +10,11 @@ import { type Pins, requiredPin } from './lib/versions.ts';
 const log = logger('build-engine');
 
 /**
- * Electric's 17.5 WASI changes replayed onto upstream PostgreSQL (#383).
+ * Electric's 17.5 WASI changes replayed onto upstream PostgreSQL (#383, #401).
  * Applied to the pinned upstream tag before wasipg's own patches; see
  * engine/patches/README.md for how it is produced and regenerated.
  */
-export const ENGINE_SOURCE_PATCH = 'engine/patches/postgresql-17.11-wasi.patch';
+export const ENGINE_SOURCE_PATCH = 'engine/patches/postgresql-18.6-wasi.patch';
 
 /** Files whose contents form the source-tree stamp (mirrors the old shell STAMP). */
 export const STAMP_FILES = [
@@ -105,7 +105,7 @@ export function patchUpstreamBuild(
     // PG_BRANCH only names directories inside Electric's WASI scripts (and the
     // postgresql-REL_17_5_WASM.patched marker the replay patch carries); the
     // PostgreSQL version itself comes from the upstream tree's configure.
-    '  -e PG_VERSION=17.11 -e PG_BRANCH=REL_17_5_WASM -e SDKROOT=/tmp/sdk \\',
+    '  -e PG_VERSION=18.6 -e PG_BRANCH=REL_17_5_WASM -e SDKROOT=/tmp/sdk \\',
     '  -e GETZIC=false -e ZIC=/usr/sbin/zic -w /workspace \\',
     // biome-ignore lint/suspicious/noTemplateCurlyInString: injected shell for the upstream build recipe, not a TS template.
     '  -e "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:?}" \\',

@@ -1,10 +1,10 @@
 di-framework embedded PGlite component
 
-The provider bundles PostgreSQL 17.11 built for WASI. The engine source is
-upstream PostgreSQL REL_17_11 (commit 083ac033419f690758508e08c1736089384bbee8)
+The provider bundles PostgreSQL 18.6 built for WASI. The engine source is
+upstream PostgreSQL REL_18_6 (commit 724edf9bde9d356724ad384a2e196edc3c9f80f7)
 with ElectricSQL's PGlite WASI changes from postgres-pglite branch
 REL_17_5_WASM-pglite (commit 2194acf356e9b7bf7cff29c4ed4bd6b82b93895d) replayed
-onto it; that replay is engine/patches/postgresql-17.11-wasi.patch in the
+onto it; that replay is engine/patches/postgresql-18.6-wasi.patch in the
 di-framework source. PostgreSQL, postgres-pglite and the replay patch are
 distributed under the PostgreSQL License, reproduced in POSTGRESQL-COPYRIGHT.
 The engine is built with the wasipg recipe and its sjlj patches (Apache-2.0;
@@ -15,7 +15,7 @@ are in PGCRYPTO-NOTICES and the OpenSSL license (Apache-2.0) in
 OPENSSL-LICENSE.
 
 Sources:
-https://github.com/postgres/postgres/tree/REL_17_11
+https://github.com/postgres/postgres/tree/REL_18_6
 https://github.com/electric-sql/postgres-pglite/tree/REL_17_5_WASM-pglite
 https://github.com/electric-sql/pglite-bindings
 https://github.com/moznion/wasipg
@@ -30,16 +30,16 @@ bounded memory buffer replaces socket-file spillover for query replies. Backend
 startup restores application session defaults after bootstrap and enables
 durable writes. The emulated dlopen keeps loaded libraries in a bounded table
 instead of writing past the end of an unsized array. Two small changes to the
-WASI glue let it compile against 17.11: initdb's frontend SplitGUCList
+WASI glue let it compile against 18.6: initdb's frontend SplitGUCList
 declaration is renamed where initdb is compiled into the backend, and the
 frontend allocator stubs gain the overflow-checked pg_malloc_mul and
-pg_realloc_mul. pgcrypto is unmodified: PostgreSQL 17.11 itself refuses
+pg_realloc_mul. pgcrypto is unmodified: PostgreSQL 18.6 itself refuses
 ciphers OpenSSL cannot run (CVE-2026-14663), which in this build includes
 Blowfish and CAST5.
 
 The wasipg notice below describes wasipg's own release artifacts, which were
 built from REL_17_5_WASM-pglite; this provider uses wasipg's build recipe and
-patches with the 17.11 source tree above.
+patches with the 18.6 source tree above.
 
 The engine's core module, support files, adapter, and the provider are
 composed into one deployable artifact. Engine code executes in the Wasm
