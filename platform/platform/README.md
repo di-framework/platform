@@ -2109,6 +2109,18 @@ ServiceAccounts, Role and RoleBinding `tenant-controller-keys` (also in `di-apik
 `di-tenant-controller-<tenant>`; and the cluster-scoped ClusterRole and ClusterRoleBinding
 `di-tenant-controller-<tenant>`.
 
+#### Cut-over evaluation (#40)
+
+With `@di-framework/platform@6.0.30` (#59 per-tenant OAuth clients, #113 HTTPS registry hop, and the full `/v1` controller surface in `platform/tenant-auth`) and `@di-framework/cli-plugin-platform@6.3.0` (`di-framework platform build --bundle` from `cli-extensions#53` and `target: controller` / `target: account` from `cli-extensions#54`), the `/v1` tenant developer loop holds end to end for `acme` with an identity-server credential only and no kubeconfig:
+
+- **Shared credential store, zero kubeconfig:** `di-tenant login` (or `di-framework platform login`) runs RFC 8252 PKCE against the tenant's public CLI OAuth client (`tenant-<tenant>-<uid8>-cli`) or validates a `dik_` API key, storing the credential in `$DI_FRAMEWORK_HOME/credentials.json` (`0600`). Both CLIs read that store, refresh expiring OAuth tokens directly at the identity server, and talk exclusively to the tenant controller's `/v1` OpenAPI contract. Kubeconfigs exist only inside the controller.
+- **Build, deploy, inspect, and debug over `/v1`:** `@di-framework/cli-plugin-platform` builds the component, pushes to the tenant's OCI registry (`GET /v1/deploy/registry`), emits the validated `DeployBundle` (`di-framework platform build --bundle`), and previews or applies deployments over `POST /v1/deploy/preview` and `POST /v1/deploy` via `target: controller` or `target: account`. `di-tenant` (and the matching controller-backed commands in `cli-plugin-platform`) handles SSE log streaming (`GET /v1/services/{service}/logs`), deployment history, stats, rollback, and removal (`GET /v1/deployments`, `GET /v1/deployments/stats`, `POST /v1/deployments/rollback`, `DELETE /v1/deployments/{service}`), write-only secrets and environment vars (`/v1/secrets`, `/v1/vars`), backing services (`POST /v1/services`, `DELETE /v1/services/{service}`), and authenticated HTTP proxy sessions (`POST /v1/services/{service}/proxy`).
+- **Accepted deviations:**
+  1. `services create` provisions backing services only (`keyvalue`, `messaging`, `blobstore`, `postgres`, `egress`); workload shapes (`http`, `cron`, `worker`) come from the `DeployBundle` produced by `di-framework platform build --bundle`.
+  2. API keys are managed in the browser console (`/-/keys`), not via a `di-tenant keys` command.
+  3. Removal gap #98 (`DELETE /v1/deployments/{service}` and `DELETE /v1/services/{service}`) is shipped across the OpenAPI contract, controller, `di-tenant`, and `cli-plugin-platform`.
+- **Disposition:** `target: controller` / `target: account` + `di-tenant` is the primary recommended tenant workflow. The legacy raw-Kubernetes tenant target (`kubeconfig` + `tenant = "<name>"`) in `@di-framework/cli-plugin-platform` is superseded for tenant developers and eligible for deprecation/retirement in `di-framework/cli-extensions`, while `target: local` and `target: k8s` remain for platform operators and local cluster development. See [`platform/tenant-cli/README.md`](../tenant-cli/README.md#cut-over-evaluation-40) for the full command walk-through.
+
 ### Contract
 
 This section defines the v1alpha1 shape for independently requestable application

@@ -219,10 +219,67 @@ rely on the system roots or `NODE_EXTRA_CA_CERTS`. Identity issuer calls do not 
 fails with a `tls:` error that names both options; an expired or revoked certificate does not
 get that hint.
 
-## What the pilot does not do yet
+## Proxy
 
-- Building the component and rendering the bundle: `deploy` sends a bundle file. The CLI-side
-  build that produces it is shared with `cli-plugin-platform` and is the next step.
-- The controller: `../tenant-auth` serves `services create` and `services proxy`; operations it
-  does not implement yet answer 501. The controller grows the endpoints behind this contract, importing the generated routes from `src/api/generated`.
-- The `proxy` session URL is an HTTP passthrough the controller serves outside the document (`/v1/services/<service>/proxy/<session>/...`); WebSocket is not supported yet. The session URL takes its origin from the Host the caller reached (the controller has no configured public URL); the passthrough uses a 60 s idle timeout, keeps relative `Location` redirects under the session URL, and marks every request as external with `X-Forwarded-*` so workload control paths stay closed. It sends `Host: <service>-<env>` (the session's env), the host the deploy lane sets as `config.host` on the bundle's `wasi:http` host interface; a bundle must leave `config.host` out or set it to that value.
+The `proxy` session URL is an HTTP passthrough the controller serves outside the document (`/v1/services/<service>/proxy/<session>/...`); WebSocket is not supported yet. The session URL takes its origin from the Host the caller reached (the controller has no configured public URL); the passthrough uses a 60 s idle timeout, keeps relative `Location` redirects under the session URL, and marks every request as external with `X-Forwarded-*` so workload control paths stay closed. It sends `Host: <service>-<env>` (the session's env), the host the deploy lane sets as `config.host` on the bundle's `wasi:http` host interface; a bundle must leave `config.host` out or set it to that value.
+
+## Cut-over evaluation (#40)
+
+Gate `G06` from Roadmap v0.1 (#499) is satisfied by `@di-framework/platform@6.0.30` (per-tenant OAuth clients in #59, HTTPS registry hop in #113, and the complete `/v1` controller API in `../tenant-auth`) together with `@di-framework/cli-plugin-platform@6.3.0` (`di-framework platform build --bundle` in `cli-extensions#53` and `target: controller` / `target: account` over `/v1` in `cli-extensions#54`).
+
+### End-to-end `/v1` developer loop (zero kubeconfig)
+
+An `acme` tenant developer completes the full build, deploy, inspect, and debug loop with an identity-server credential (or `dik_` API key) only. Neither CLI reads or writes a kubeconfig; both share `$DI_FRAMEWORK_HOME/credentials.json` (mode `0600`, default `~/.di-framework/credentials.json`) and refresh OAuth tokens at the identity server automatically:
+
+1. **Authenticate** against the tenant controller (PKCE browser flow or `--api-key`):
+   ```sh
+   di-tenant login --controller https://controller.acme.localhost:28180 --ca-file ca.crt
+   di-tenant whoami
+   ```
+2. **Configure a controller-backed target** in `di-framework.deploy.toml` (no `kubeconfig` field):
+   ```toml
+   default-target = "acme"
+
+   [targets.acme]
+   account = "acme"
+   controller = "https://controller.acme.localhost:28180"
+   env = "prod"
+   ```
+3. **Build and publish a `DeployBundle`** (`bundle.json` + component `.wasm` pushed to the tenant's OCI registry using the caller's identity bearer):
+   ```sh
+   di-tenant registry login
+   di-framework platform build --bundle bundle.json --target acme --env prod
+   ```
+4. **Preview and deploy** over `/v1` (`POST /v1/deploy/preview` and `POST /v1/deploy`), either directly from `cli-plugin-platform` or from the emitted bundle with `di-tenant`:
+   ```sh
+   di-framework platform deploy --target acme --env prod --preview
+   di-framework platform deploy --target acme --env prod
+   # or from a pre-built bundle:
+   di-tenant deploy preview --env prod --bundle bundle.json
+   di-tenant deploy apply --env prod --bundle bundle.json
+   ```
+5. **Inspect, configure, debug, and clean up** via `/v1`:
+   ```sh
+   di-tenant logs --service web --env prod --follow
+   di-tenant deployments list --env prod --service web
+   di-tenant deployments stats --env prod
+   di-tenant deployments rollback --service web --env prod
+   di-tenant secrets set DB_URL --env prod --from-file ./db-url.txt
+   di-tenant vars set LOG_LEVEL --env prod --from-file -
+   di-tenant services create postgres --name orders-db --env prod --storage 1Gi
+   di-tenant proxy --service web --env prod
+   di-tenant deployments remove --service web --env prod
+   di-tenant services delete --name orders-db --env prod
+   ```
+
+### Accepted deviations from the initial #40 sketch
+
+1. **Backing services vs. workload shapes:** `services create` provisions platform backing services only (`keyvalue`, `messaging`, `blobstore`, `postgres`, `egress`). Application workload shapes (`http`, `cron`, `worker`) are rendered into the `DeployBundle` by `di-framework platform build --bundle` and applied through `POST /v1/deploy`.
+2. **API key management:** Tenant API keys (`dik_…`) are issued, listed, and revoked in the tenant browser console (`/-/keys`), not via a `di-tenant keys` subcommand; `di-tenant login --api-key <key>` consumes them for headless and CI sessions.
+3. **Resource removal (#98):** `DELETE /v1/deployments/{service}` (`di-tenant deployments remove` / `di-framework platform destroy`) and `DELETE /v1/services/{service}` (`di-tenant services delete` / `di-framework platform service delete`) are implemented in the contract, controller, and both CLIs.
+
+### Cut-over conclusion and disposition
+
+- **Criterion met:** An `acme` tenant developer deploys, inspects, and debugs workloads end to end through the `/v1` controller contract using only an identity-server credential, with zero kubeconfig on disk and no `kubectl` access required.
+- **Disposition:** Controller-backed targets (`target: controller` / `target: account`) in `@di-framework/cli-plugin-platform` paired with `di-tenant` are now the primary recommended workflow for tenant developers. The legacy raw-Kubernetes tenant target (`kubeconfig` + `tenant = "<name>"`) in `@di-framework/cli-plugin-platform` is superseded for tenant developers and eligible for deprecation/retirement in `di-framework/cli-extensions`, while `target: local` (managed Pulumi) and `target: k8s` (external cluster with `namespace`) remain for platform operators and local cluster development.
+
