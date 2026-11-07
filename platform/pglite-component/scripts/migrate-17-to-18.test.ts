@@ -1,25 +1,51 @@
 import { describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { UsageError } from './lib/cli.ts';
-import { parseMigrateArgs, USAGE, validateMigrationDirs } from './migrate-17-to-18.ts';
+import { createContext, UsageError } from './lib/cli.ts';
+import {
+  migrateCluster17To18,
+  parseMigrateArgs,
+  USAGE,
+  validateMigrationDirs,
+} from './migrate-17-to-18.ts';
 
 describe('parseMigrateArgs', () => {
-  test('parses --from, --to, and optional --dump', () => {
+  test('parses --from, --to, optional --database, and optional --dump', () => {
     expect(parseMigrateArgs(['--from', '/tmp/pg17', '--to', '/tmp/pg18'])).toEqual({
       help: false,
       fromDir: resolve('/tmp/pg17'),
       toDir: resolve('/tmp/pg18'),
+      database: undefined,
       dumpPath: undefined,
     });
     expect(
-      parseMigrateArgs(['--from', '/tmp/pg17', '--to', '/tmp/pg18', '--dump', '/tmp/dump.sql']),
+      parseMigrateArgs([
+        '--from',
+        '/tmp/pg17',
+        '--to',
+        '/tmp/pg18',
+        '--database',
+        'template1',
+        '--dump',
+        '/tmp/dump.sql',
+      ]),
     ).toEqual({
       help: false,
       fromDir: resolve('/tmp/pg17'),
       toDir: resolve('/tmp/pg18'),
+      database: 'template1',
       dumpPath: resolve('/tmp/dump.sql'),
+    });
+    expect(
+      parseMigrateArgs(['--from', '/tmp/pg17', '--to', '/tmp/pg18', '--database', 'postgres']),
+    ).toEqual({
+      help: false,
+      fromDir: resolve('/tmp/pg17'),
+      toDir: resolve('/tmp/pg18'),
+      database: 'postgres',
+      dumpPath: undefined,
     });
   });
 
@@ -28,9 +54,15 @@ describe('parseMigrateArgs', () => {
     expect(parseMigrateArgs(['-h'])).toEqual({ help: true });
   });
 
-  test('rejects missing or identical directories', () => {
+  test('rejects missing, invalid, or identical arguments', () => {
     expect(() => parseMigrateArgs([])).toThrow(UsageError);
     expect(() => parseMigrateArgs(['--from', '/tmp/pg17'])).toThrow(USAGE);
+    expect(() => parseMigrateArgs(['--from'])).toThrow('requires an argument');
+    expect(() => parseMigrateArgs(['--from', '--to', '/tmp/pg18'])).toThrow('requires an argument');
+    expect(() => parseMigrateArgs(['--unknown', 'x'])).toThrow('unknown or unexpected argument');
+    expect(() =>
+      parseMigrateArgs(['--from', '/tmp/pg17', '--to', '/tmp/pg18', '--database', 'other']),
+    ).toThrow('must be "postgres" or "template1"');
     expect(() => parseMigrateArgs(['--from', '/tmp/same', '--to', '/tmp/same'])).toThrow(
       'must be distinct directories',
     );
@@ -71,6 +103,33 @@ describe('validateMigrationDirs', () => {
       await mkdir(join(toDir, 'pglite', 'data'), { recursive: true });
       await writeFile(join(toDir, 'pglite', 'data', 'PG_VERSION'), '18\n');
       await expect(validateMigrationDirs(from17, toDir)).rejects.toThrow('refuse to overwrite');
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  test('cleans up partial target directory if migration fails mid-flight', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'df-pglite-mig-fail.'));
+    try {
+      const fromDir = join(base, 'from17');
+      const toDir = join(base, 'to18');
+      const workDir = join(base, 'work');
+      await mkdir(join(fromDir, 'pglite', 'data'), { recursive: true });
+      await writeFile(join(fromDir, 'pglite', 'data', 'PG_VERSION'), '17\n');
+      await mkdir(workDir, { recursive: true });
+
+      const ctx = await createContext();
+      await expect(
+        migrateCluster17To18(ctx, {
+          fromDir,
+          toDir,
+          previousComposed: join(base, 'missing-prev.wasm'),
+          currentComposed: join(base, 'missing-curr.wasm'),
+          workDir,
+        }),
+      ).rejects.toThrow('wasmtime export-sql failed');
+
+      expect(existsSync(toDir)).toBe(false);
     } finally {
       await rm(base, { recursive: true, force: true });
     }

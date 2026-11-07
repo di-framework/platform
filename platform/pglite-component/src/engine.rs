@@ -751,9 +751,15 @@ mod tests {
              see platform/pglite-component/README.md#migrating-from-postgresql-17-to-18 \
              (or run `bun platform/pglite-component/scripts/migrate-17-to-18.ts`)"
         );
-        assert!(check_data_version("16").unwrap_err().contains("PG_VERSION is 16,"));
-        assert!(check_data_version("19").unwrap_err().contains("PG_VERSION is 19,"));
-        assert!(check_data_version("  ").unwrap_err().contains("PG_VERSION is (empty),"));
+        assert!(check_data_version("16")
+            .unwrap_err()
+            .contains("PG_VERSION is 16,"));
+        assert!(check_data_version("19")
+            .unwrap_err()
+            .contains("PG_VERSION is 19,"));
+        assert!(check_data_version("  ")
+            .unwrap_err()
+            .contains("PG_VERSION is (empty),"));
     }
 
     #[test]

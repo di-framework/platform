@@ -34,8 +34,7 @@ fn col<'a>(row: &'a [(String, Value)], name: &str) -> &'a Value {
 fn main() {
     // --- server version: proves the handshake (startup + auth + ReadyForQuery) ---
     // The cross-version step runs `upgrade-write` against the previous release.
-    let expected =
-        std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "18.6".into());
+    let expected = std::env::var("PGLITE_SMOKE_SERVER_VERSION").unwrap_or_else(|_| "18.6".into());
     let version = server_version().expect("server-version");
     assert!(
         version.contains(&expected),
@@ -672,7 +671,9 @@ const SHA256_A: &str = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785
 const UPGRADE_SECRET: &str = "written by the previous release";
 
 /// Run by the previous release (PostgreSQL 17.5) on a fresh data directory:
-/// a table, pgcrypto, PGP ciphertext, and a plpgsql function to migrate to 18.6.
+/// tables (with serial, identity, generated columns, and a foreign key),
+/// a standalone index, a view, pgcrypto, PGP ciphertext, and a plpgsql function
+/// to migrate to 18.6.
 fn upgrade_write(db: &Connection) {
     db.exec("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         .expect("CREATE EXTENSION pgcrypto");
@@ -687,10 +688,34 @@ fn upgrade_write(db: &Connection) {
     )
     .expect("insert upgrade_check");
     db.exec(
+        "CREATE TABLE upgrade_items ( \
+           id serial PRIMARY KEY, \
+           check_id int NOT NULL REFERENCES upgrade_check(id), \
+           seq_num int GENERATED ALWAYS AS IDENTITY, \
+           label text NOT NULL, \
+           upper_label text GENERATED ALWAYS AS (upper(label)) STORED \
+         )",
+    )
+    .expect("create upgrade_items");
+    db.run(
+        "INSERT INTO upgrade_items (check_id, label) VALUES (1, $1)",
+        &[Value::Text("item-one".into())],
+    )
+    .expect("insert upgrade_items");
+    db.exec("CREATE INDEX upgrade_items_label_idx ON upgrade_items (label)")
+        .expect("create upgrade_items_label_idx");
+    db.exec(
+        "CREATE VIEW upgrade_summary AS \
+         SELECT c.id, c.payload, i.label, i.upper_label \
+         FROM upgrade_check c JOIN upgrade_items i ON i.check_id = c.id",
+    )
+    .expect("create upgrade_summary view");
+    db.exec(
         "CREATE FUNCTION upgrade_greeting(name text) RETURNS text \
          LANGUAGE plpgsql AS $$ BEGIN RETURN 'hello ' || name; END $$",
     )
     .expect("create upgrade_greeting");
+    db.exec("CHECKPOINT").expect("checkpoint upgrade_write");
 }
 
 /// Path 1 (#401): opening an unmigrated PostgreSQL 17 data directory under the
@@ -708,7 +733,9 @@ fn upgrade_refused_mode() {
                 "unexpected version mismatch message: {message}"
             );
             assert!(
-                message.contains("platform/pglite-component/README.md#migrating-from-postgresql-17-to-18"),
+                message.contains(
+                    "platform/pglite-component/README.md#migrating-from-postgresql-17-to-18"
+                ),
                 "missing README migration anchor: {message}"
             );
             assert!(
@@ -725,7 +752,103 @@ fn upgrade_refused_mode() {
 fn export_sql_mode() {
     let dump_path =
         std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
-    let db = open("/data/pglite", None).expect("open source cluster for export");
+    let requested_db = std::env::var("PGLITE_MIGRATE_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let assert_empty_public =
+        std::env::var("PGLITE_MIGRATE_ASSERT_EMPTY_PUBLIC").as_deref() == Ok("1");
+    let options = requested_db.as_deref().map(database);
+    let db = match open("/data/pglite", options.as_ref()) {
+        Ok(db) => db,
+        Err(Error::OpenFailed(msg))
+            if assert_empty_public && msg.contains("supports only the template1 database") =>
+        {
+            println!("sibling database public schema is empty");
+            return;
+        }
+        Err(err) => panic!("open source cluster for export: {err:?}"),
+    };
+
+    if assert_empty_public {
+        let active_db = current_database(&db);
+        let found = db
+            .first(
+                "SELECT string_agg(item, ', ' ORDER BY item) AS items FROM ( \
+                   SELECT c.relname AS item \
+                   FROM pg_class c \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE n.nspname = 'public' \
+                     AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+                     ) \
+                   UNION ALL \
+                   SELECT p.proname AS item \
+                   FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                   WHERE n.nspname = 'public' \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+                     ) \
+                 ) sub",
+                &[],
+            )
+            .expect("query non-default database public objects")
+            .expect("non-default database row");
+        if let Value::Text(items) = col(&found, "items") {
+            panic!(
+                "non-default database {active_db:?} contains user objects in public ({items}); \
+                 pass --database {active_db} to migrate it separately"
+            );
+        }
+        db.close().expect("close empty-check database");
+        return;
+    }
+
+    // Fail closed if public contains object kinds this logical exporter does not support.
+    let unsupported = db
+        .first(
+            "SELECT string_agg(item, ', ' ORDER BY item) AS items FROM ( \
+               SELECT format('%s %I', \
+                        CASE c.relkind \
+                          WHEN 'm' THEN 'materialized view' \
+                          WHEN 'p' THEN 'partitioned table' \
+                          WHEN 'f' THEN 'foreign table' \
+                          ELSE 'relation' \
+                        END, \
+                        c.relname) AS item \
+               FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'public' \
+                 AND c.relkind IN ('m', 'p', 'f') \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+                 ) \
+               UNION ALL \
+               SELECT format('procedure %I', p.proname) AS item \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               WHERE n.nspname = 'public' \
+                 AND p.prokind = 'p' \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e' \
+                 ) \
+               UNION ALL \
+               SELECT format('trigger %I on %I', t.tgname, c.relname) AS item \
+               FROM pg_trigger t \
+               JOIN pg_class c ON c.oid = t.tgrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = 'public' \
+                 AND NOT t.tgisinternal \
+             ) sub",
+            &[],
+        )
+        .expect("query unsupported public objects")
+        .expect("unsupported public objects row");
+    if let Value::Text(items) = col(&unsupported, "items") {
+        panic!("unsupported public objects cannot be migrated automatically: {items}");
+    }
+
     let mut out = String::from("-- di-framework:pglite logical export\n");
 
     let exts = db
@@ -740,9 +863,44 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
+    // Export standalone and serial sequences before tables (identity sequences
+    // have deptype = 'i' and are created by `GENERATED ... AS IDENTITY` on the table).
+    let seqs = db
+        .query(
+            "SELECT format( \
+               'CREATE SEQUENCE IF NOT EXISTS public.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s%s;', \
+               s.sequencename, \
+               s.data_type, \
+               s.increment_by, \
+               s.min_value, \
+               s.max_value, \
+               s.start_value, \
+               s.cache_size, \
+               CASE WHEN s.cycle THEN ' CYCLE' ELSE ' NO CYCLE' END \
+             ) AS stmt \
+             FROM pg_sequences s \
+             JOIN pg_class c ON c.relname = s.sequencename \
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname \
+             WHERE s.schemaname = 'public' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('e', 'i') \
+               ) \
+             ORDER BY s.sequencename",
+            &[],
+        )
+        .expect("query sequences");
+    for row in seqs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
     let tables = db
         .query(
             "SELECT c.oid::int8 AS oid, c.relname AS relname, \
+                    EXISTS ( \
+                      SELECT 1 FROM pg_attribute a \
+                      WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity <> '' \
+                    ) AS has_identity, \
                     format('CREATE TABLE public.%I (%s);', \
                       c.relname, \
                       concat_ws(', ', \
@@ -750,7 +908,13 @@ fn export_sql_mode() {
                            format('%I %s%s%s', \
                              a.attname, \
                              format_type(a.atttypid, a.atttypmod), \
-                             CASE WHEN ad.adbin IS NOT NULL THEN ' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid) ELSE '' END, \
+                             CASE \
+                               WHEN a.attidentity = 'a' THEN ' GENERATED ALWAYS AS IDENTITY' \
+                               WHEN a.attidentity = 'd' THEN ' GENERATED BY DEFAULT AS IDENTITY' \
+                               WHEN a.attgenerated = 's' THEN ' GENERATED ALWAYS AS (' || pg_get_expr(ad.adbin, ad.adrelid) || ') STORED' \
+                               WHEN ad.adbin IS NOT NULL THEN ' DEFAULT ' || pg_get_expr(ad.adbin, ad.adrelid) \
+                               ELSE '' \
+                             END, \
                              CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END \
                            ), \
                            ', ' ORDER BY a.attnum \
@@ -780,14 +944,20 @@ fn export_sql_mode() {
     for table in tables {
         let oid = int(col(&table, "oid"));
         let relname = text(col(&table, "relname"));
+        let has_identity = matches!(col(&table, "has_identity"), Value::Boolean(true));
         let ddl = text(col(&table, "ddl"));
         out.push_str(&ddl);
         out.push('\n');
 
+        let overriding = if has_identity {
+            " OVERRIDING SYSTEM VALUE"
+        } else {
+            ""
+        };
         let row_query_row = db
             .first(
                 "SELECT format( \
-                   'SELECT ''INSERT INTO public.%I (%s) VALUES ('' || %s || '');'' AS stmt FROM public.%I', \
+                   'SELECT ''INSERT INTO public.%I (%s)' || $3::text || ' VALUES ('' || %s || '');'' AS stmt FROM public.%I', \
                    $1::text, \
                    string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum), \
                    string_agg( \
@@ -801,16 +971,85 @@ fn export_sql_mode() {
                    $1::text \
                  ) AS row_query \
                  FROM pg_attribute a \
-                 WHERE a.attrelid = $2::int8::oid AND a.attnum > 0 AND NOT a.attisdropped",
-                &[Value::Text(relname), Value::Integer(oid)],
+                 WHERE a.attrelid = $2::int8::oid \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                   AND a.attgenerated = ''",
+                &[
+                    Value::Text(relname),
+                    Value::Integer(oid),
+                    Value::Text(overriding.into()),
+                ],
             )
             .expect("build row export query")
             .expect("row export query");
-        let row_query = text(col(&row_query_row, "row_query"));
-        for ins in db.query(&row_query, &[]).expect("export table rows") {
-            out.push_str(&text(col(&ins, "stmt")));
-            out.push('\n');
+        if let Value::Text(row_query) = col(&row_query_row, "row_query") {
+            for ins in db.query(row_query, &[]).expect("export table rows") {
+                out.push_str(&text(col(&ins, "stmt")));
+                out.push('\n');
+            }
         }
+    }
+
+    // Advance all public sequences (both serial and identity) whose value was drawn.
+    let seq_vals = db
+        .query(
+            "SELECT format('SELECT pg_catalog.setval(%L, %s, true);', \
+                      format('public.%I', s.sequencename), \
+                      s.last_value) AS stmt \
+             FROM pg_sequences s \
+             WHERE s.schemaname = 'public' AND s.last_value IS NOT NULL \
+             ORDER BY s.sequencename",
+            &[],
+        )
+        .expect("query sequence values");
+    for row in seq_vals {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Foreign keys after all table data is loaded so table order cannot break references.
+    let fks = db
+        .query(
+            "SELECT format('ALTER TABLE public.%I ADD CONSTRAINT %I %s;', \
+                      c.relname, con.conname, pg_get_constraintdef(con.oid)) AS stmt \
+             FROM pg_constraint con \
+             JOIN pg_class c ON c.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND con.contype = 'f' \
+             ORDER BY c.relname, con.conname",
+            &[],
+        )
+        .expect("query foreign keys");
+    for row in fks {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
+    // Standalone indexes not backing a constraint.
+    let idxs = db
+        .query(
+            "SELECT pg_get_indexdef(i.indexrelid) || ';' AS stmt \
+             FROM pg_index i \
+             JOIN pg_class idx ON idx.oid = i.indexrelid \
+             JOIN pg_class tbl ON tbl.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = tbl.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND tbl.relkind = 'r' \
+               AND i.indislive \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid \
+               ) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = idx.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY tbl.relname, idx.relname",
+            &[],
+        )
+        .expect("query standalone indexes");
+    for row in idxs {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
     }
 
     let funcs = db
@@ -832,6 +1071,26 @@ fn export_sql_mode() {
         out.push('\n');
     }
 
+    let views = db
+        .query(
+            "SELECT format('CREATE OR REPLACE VIEW public.%I AS %s;', \
+                      c.relname, pg_get_viewdef(c.oid, true)) AS stmt \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND c.relkind = 'v' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY c.relname",
+            &[],
+        )
+        .expect("query views");
+    for row in views {
+        out.push_str(&text(col(&row, "stmt")));
+        out.push('\n');
+    }
+
     db.close().expect("close export-sql");
     std::fs::write(&dump_path, out).expect("write exported SQL dump");
 }
@@ -840,8 +1099,12 @@ fn export_sql_mode() {
 fn import_sql_mode() {
     let dump_path =
         std::env::var("PGLITE_MIGRATE_DUMP_PATH").unwrap_or_else(|_| "/dump/migration.sql".into());
+    let requested_db = std::env::var("PGLITE_MIGRATE_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let options = requested_db.as_deref().map(database);
     let sql = std::fs::read_to_string(&dump_path).expect("read exported SQL dump");
-    let db = open("/data/pglite", None).expect("open target cluster for import");
+    let db = open("/data/pglite", options.as_ref()).expect("open target cluster for import");
     db.begin().expect("begin import transaction");
     db.exec(&sql).expect("execute imported SQL dump");
     db.commit().expect("commit import transaction");
@@ -877,6 +1140,61 @@ fn upgrade_read(db: &Connection) {
     assert_eq!(
         first_text(db, "SELECT upgrade_greeting('pg18') AS g", &[]),
         "hello pg18"
+    );
+
+    // Verify migrated serial, identity, generated column, foreign key, index, and view.
+    let item = db
+        .first(
+            "SELECT id::int8 AS id, seq_num::int8 AS seq_num, label, upper_label \
+             FROM upgrade_items WHERE id = 1",
+            &[],
+        )
+        .expect("read upgrade_items")
+        .expect("upgrade_items row 1");
+    assert_eq!(int(col(&item, "id")), 1);
+    assert_eq!(int(col(&item, "seq_num")), 1);
+    assert_eq!(text(col(&item, "label")), "item-one");
+    assert_eq!(text(col(&item, "upper_label")), "ITEM-ONE");
+
+    // Inserting without id/seq_num uses the migrated serial + identity sequences (advancing to 2).
+    let item2 = db
+        .first(
+            "INSERT INTO upgrade_items (check_id, label) VALUES (1, 'item-two') \
+             RETURNING id::int8 AS id, seq_num::int8 AS seq_num, upper_label",
+            &[],
+        )
+        .expect("insert second upgrade_item")
+        .expect("second upgrade_item row");
+    assert_eq!(int(col(&item2, "id")), 2);
+    assert_eq!(int(col(&item2, "seq_num")), 2);
+    assert_eq!(text(col(&item2, "upper_label")), "ITEM-TWO");
+
+    // Foreign key constraint (contype = 'f') must be enforced after migration.
+    let fk_err = db.run(
+        "INSERT INTO upgrade_items (check_id, label) VALUES (999, 'bad-fk')",
+        &[],
+    );
+    assert!(
+        matches!(fk_err, Err(Error::ExecutionFailed(ref e)) if e.code == "23503"),
+        "expected foreign_key_violation (23503), got {fk_err:?}"
+    );
+
+    // Standalone index and view must be present after migration.
+    let idx = db
+        .first(
+            "SELECT to_regclass('public.upgrade_items_label_idx') IS NOT NULL AS present",
+            &[],
+        )
+        .expect("check migrated index")
+        .expect("index row");
+    assert!(matches!(col(&idx, "present"), Value::Boolean(true)));
+    assert_eq!(
+        first_text(
+            db,
+            "SELECT upper_label FROM upgrade_summary WHERE label = 'item-one'",
+            &[]
+        ),
+        "ITEM-ONE"
     );
 
     // The extension migrated from 17.5 resolves its functions in 18.6.

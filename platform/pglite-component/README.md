@@ -532,11 +532,11 @@ root (using this 18.6 provider):
 cp -R ./data-pg17 ./data-pg17.backup
 
 # 2. Export the 17 cluster and import it into a new 18 mount directory
-#    (optionally keeping the logical SQL dump with --dump).
+#    (optionally keeping a copy of the logical SQL dump with --dump, or
+#    selecting an explicit database with --database <postgres|template1>).
 bun platform/pglite-component/scripts/migrate-17-to-18.ts \
   --from ./data-pg17 \
-  --to ./data-pg18 \
-  --dump ./pg17-export.sql
+  --to ./data-pg18
 
 # 3. Point the workload mount at ./data-pg18, verify the application, and retire ./data-pg17.
 ```
@@ -544,21 +544,35 @@ bun platform/pglite-component/scripts/migrate-17-to-18.ts \
 What `scripts/migrate-17-to-18.ts` does:
 1. Validates that `<from>/pglite/data/PG_VERSION` is `17` and refuses to overwrite
    `<to>` if `<to>/pglite/data/PG_VERSION` already exists.
-2. Composes the pinned PostgreSQL 17 provider (`PGLITE_UPGRADE_FROM_*` in
-   `scripts/tool-versions.env`) and runs it in `export-sql` mode to dump
-   installed extensions (`pgcrypto`), `public` tables, column defaults,
-   constraints, table rows (with lossless typed literals including `bytea`
-   ciphertext), and user-defined `public` functions.
-3. Composes this PostgreSQL 18.6 provider and runs it in `import-sql` mode on
-   `<to>`, which initializes a new PostgreSQL 18 cluster in `postgres` (with
-   `data_checksums = on` and the `di-framework-database` marker) and executes the
-   SQL dump inside a single transaction followed by `CHECKPOINT`.
+2. When `--database` is not specified, checks that the non-default sibling
+   database (`postgres` or `template1`) has no user objects in `public` so data
+   written via explicit `open-options.database` is never silently skipped.
+3. Composes the pinned PostgreSQL 17 provider (`PGLITE_UPGRADE_FROM_*` in
+   `scripts/tool-versions.env`) and runs it in `export-sql` mode into a
+   temporary directory (removed automatically in `finally`) to dump installed
+   extensions (`pgcrypto`), `public` sequences, `public` tables (including
+   `serial`, `GENERATED ... AS IDENTITY`, and `GENERATED ALWAYS AS (...) STORED`
+   columns), `PRIMARY KEY`/`UNIQUE`/`CHECK` constraints, table rows (with
+   lossless typed literals including `bytea` ciphertext), sequence values
+   (`setval`), `FOREIGN KEY` constraints, standalone indexes, `public` views,
+   and user-defined `public` functions. If `public` contains unsupported objects
+   (such as triggers, procedures, materialized views, or partitioned tables),
+   export fails closed instead of silently omitting them.
+4. Composes this PostgreSQL 18.6 provider and runs it in `import-sql` mode on
+   `<to>`, which initializes a new PostgreSQL 18 cluster (with
+   `data_checksums = on` and the `di-framework-database` marker when importing
+   into `postgres`) and executes the SQL dump inside a single transaction
+   followed by `CHECKPOINT`. If export or import fails, any partially created
+   `<to>/pglite` state is cleaned up automatically.
 
-If your application manages custom schemas outside `public` or custom migration
-state, you can also export through your application under the 17.x provider,
-deploy this 18.6 provider on an empty root, run your application migrations,
-and import the exported data. If the root is encrypted with `pglite-encfs`,
-compose `pglite-encfs` with the same key for both the export and the import.
+If your application manages custom schemas outside `public` or uses objects
+outside the exporter's scope, export through your application under the 17.x
+provider, deploy this 18.6 provider on an empty root, run your application
+migrations, and import the exported data. Note that `scripts/migrate-17-to-18.ts`
+mounts `<from>` and `<to>` as raw host directories in Wasmtime (`wasi:filesystem`);
+for roots encrypted with `pglite-encfs`, run the export and import through a
+component composed with `pglite-encfs` (and the same encryption key) rather than
+passing raw ciphertext directories to `--from`.
 
 ## Implementation
 

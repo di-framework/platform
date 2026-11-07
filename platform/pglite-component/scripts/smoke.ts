@@ -217,7 +217,6 @@ async function upgradeSmoke(ctx: Context, consumer: string, composed: string, sm
       previousComposed: previous,
       currentComposed: composed,
       workDir: upgradeDir,
-      dumpPath: join(upgradeDir, 'migrated-17-to-18.sql'),
       fromServerVersion: release.postgres,
     });
     await expectMarker(dataDir18, 'postgres\n', 'migrated PG 18 directory');

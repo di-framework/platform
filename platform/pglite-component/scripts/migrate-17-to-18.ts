@@ -7,56 +7,84 @@
  * initializes a new PG 18 cluster in the target mount directory and imports the SQL
  * dump inside a single transaction using the 18.x provider component.
  */
-import { copyFile, mkdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { $ } from 'bun';
 import { composeConsumer } from './compose.ts';
-import {
-  type Args,
-  type Command,
-  type Context,
-  logger,
-  parseFlags,
-  run,
-  UsageError,
-} from './lib/cli.ts';
+import { type Args, type Command, type Context, logger, run, UsageError } from './lib/cli.ts';
 import { fetchVerified } from './lib/fetch.ts';
 import { type Pins, requiredPin } from './lib/versions.ts';
 
 const log = logger('migrate-17-to-18');
 
 export const USAGE =
-  'usage: bun scripts/migrate-17-to-18.ts --from <pg17-mount-dir> --to <pg18-mount-dir> [--dump <sql-file>]';
+  'usage: bun scripts/migrate-17-to-18.ts --from <pg17-mount-dir> --to <pg18-mount-dir> [--database <postgres|template1>] [--dump <sql-file>]';
+
+export type ApplicationDatabase = 'postgres' | 'template1';
 
 export interface MigrateOptions {
   fromDir: string;
   toDir: string;
+  database?: ApplicationDatabase;
   dumpPath?: string;
 }
 
+function readFlagValue(argv: string[], index: number, flag: string): string {
+  const next = argv[index + 1];
+  if (next === undefined || next.startsWith('-')) {
+    throw new UsageError(`option ${flag} requires an argument\n\n${USAGE}`);
+  }
+  return next;
+}
+
 export function parseMigrateArgs(argv: string[]): Args<MigrateOptions> {
-  const parsed = parseFlags(
-    argv,
-    {
-      from: { type: 'string' },
-      to: { type: 'string' },
-      dump: { type: 'string' },
-    },
-    USAGE,
-  );
-  if (parsed.help) return parsed;
-  const fromRaw = parsed.values.from?.trim();
-  const toRaw = parsed.values.to?.trim();
+  let fromRaw: string | undefined;
+  let toRaw: string | undefined;
+  let dumpRaw: string | undefined;
+  let databaseRaw: string | undefined;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '-h' || arg === '--help') {
+      return { help: true };
+    }
+    if (arg === '--from') {
+      fromRaw = readFlagValue(argv, i, '--from').trim();
+      i++;
+    } else if (arg === '--to') {
+      toRaw = readFlagValue(argv, i, '--to').trim();
+      i++;
+    } else if (arg === '--dump') {
+      dumpRaw = readFlagValue(argv, i, '--dump').trim();
+      i++;
+    } else if (arg === '--database') {
+      databaseRaw = readFlagValue(argv, i, '--database').trim();
+      i++;
+    } else {
+      throw new UsageError(`unknown or unexpected argument: ${arg}\n\n${USAGE}`);
+    }
+  }
+
   if (!fromRaw || !toRaw) {
     throw new UsageError(`--from and --to are required\n\n${USAGE}`);
+  }
+  let database: ApplicationDatabase | undefined;
+  if (databaseRaw !== undefined && databaseRaw !== '') {
+    if (databaseRaw !== 'postgres' && databaseRaw !== 'template1') {
+      throw new UsageError(
+        `--database must be "postgres" or "template1" (got ${JSON.stringify(databaseRaw)})\n\n${USAGE}`,
+      );
+    }
+    database = databaseRaw;
   }
   const fromDir = resolve(fromRaw);
   const toDir = resolve(toRaw);
   if (fromDir === toDir) {
     throw new UsageError(`--from and --to must be distinct directories (${fromDir})\n\n${USAGE}`);
   }
-  const dumpPath = parsed.values.dump?.trim() ? resolve(parsed.values.dump.trim()) : undefined;
-  return { help: false, fromDir, toDir, dumpPath };
+  const dumpPath = dumpRaw ? resolve(dumpRaw) : undefined;
+  return { help: false, fromDir, toDir, database, dumpPath };
 }
 
 /** Validate that `fromDir` contains a PostgreSQL 17 cluster and `toDir` does not already hold a cluster. */
@@ -87,6 +115,7 @@ export interface MigrateClusterParams {
   previousComposed: string;
   currentComposed: string;
   workDir: string;
+  database?: ApplicationDatabase;
   dumpPath?: string;
   fromServerVersion?: string;
 }
@@ -123,7 +152,7 @@ async function runWasmtimeStep(
     const why = proc.signalCode ? `signal ${proc.signalCode}` : `exit ${code}`;
     throw new Error(`wasmtime ${mode} failed with ${why}`);
   }
-  if (!output.split('\n').some((line) => line === marker)) {
+  if (!output.split('\n').includes(marker)) {
     throw new Error(`wasmtime ${mode}: marker ${marker} not found`);
   }
 }
@@ -142,61 +171,104 @@ export async function migrateCluster17To18(
     previousComposed,
     currentComposed,
     workDir,
+    database,
     dumpPath,
     fromServerVersion = '17.5',
   } = params;
   await validateMigrationDirs(fromDir, toDir);
 
-  const dumpDir = join(workDir, 'migrate-dump');
-  await rm(dumpDir, { recursive: true, force: true });
-  await mkdir(dumpDir, { recursive: true });
-  await mkdir(toDir, { recursive: true });
+  const toExisted = (await $`test -d ${toDir}`.nothrow()).exitCode === 0;
+  const dumpDir = await mkdtemp(join(tmpdir(), 'df-pglite-mig-dump.'));
+  const dbEnv = database ? ['--env', `PGLITE_MIGRATE_DATABASE=${database}`] : [];
 
-  const sqlFile = join(dumpDir, 'migration.sql');
-  await runWasmtimeStep(
-    ctx,
-    previousComposed,
-    'export-sql',
-    'export sql ok',
-    [
-      '--dir',
-      `${fromDir}::/data`,
-      '--dir',
-      `${dumpDir}::/dump`,
-      '--env',
-      `PGLITE_SMOKE_SERVER_VERSION=${fromServerVersion}`,
-    ],
-    join(workDir, 'migrate-export.log'),
-  );
-  log('export sql ok');
+  try {
+    if (!database) {
+      const hasMarker = await Bun.file(
+        join(fromDir, 'pglite', 'data', 'di-framework-database'),
+      ).exists();
+      const siblingDb: ApplicationDatabase = hasMarker ? 'template1' : 'postgres';
+      const siblingOid = siblingDb === 'postgres' ? '5' : '1';
+      if (
+        await Bun.file(join(fromDir, 'pglite', 'data', 'base', siblingOid, 'PG_VERSION')).exists()
+      ) {
+        await runWasmtimeStep(
+          ctx,
+          previousComposed,
+          'export-sql',
+          'sibling database public schema is empty',
+          [
+            '--dir',
+            `${fromDir}::/data`,
+            '--dir',
+            `${dumpDir}::/dump`,
+            '--env',
+            `PGLITE_SMOKE_SERVER_VERSION=${fromServerVersion}`,
+            '--env',
+            `PGLITE_MIGRATE_DATABASE=${siblingDb}`,
+            '--env',
+            'PGLITE_MIGRATE_ASSERT_EMPTY_PUBLIC=1',
+          ],
+          join(workDir, 'migrate-check-sibling.log'),
+        );
+      }
+    }
 
-  const sql = await Bun.file(sqlFile).text();
-  if (!sql.startsWith('-- di-framework:pglite logical export')) {
-    throw new Error('exported SQL dump is missing header');
-  }
-  if (dumpPath) {
-    await copyFile(sqlFile, dumpPath);
-  }
-
-  await runWasmtimeStep(
-    ctx,
-    currentComposed,
-    'import-sql',
-    'import sql ok',
-    ['--dir', `${toDir}::/data`, '--dir', `${dumpDir}::/dump`],
-    join(workDir, 'migrate-import.log'),
-  );
-  log('import sql ok');
-
-  const targetPgVersion = (
-    await Bun.file(join(toDir, 'pglite', 'data', 'PG_VERSION')).text()
-  ).trim();
-  if (targetPgVersion !== '18') {
-    throw new Error(
-      `migrated target cluster wrote PG_VERSION ${JSON.stringify(targetPgVersion)}, expected "18"`,
+    const sqlFile = join(dumpDir, 'migration.sql');
+    await runWasmtimeStep(
+      ctx,
+      previousComposed,
+      'export-sql',
+      'export sql ok',
+      [
+        '--dir',
+        `${fromDir}::/data`,
+        '--dir',
+        `${dumpDir}::/dump`,
+        '--env',
+        `PGLITE_SMOKE_SERVER_VERSION=${fromServerVersion}`,
+        ...dbEnv,
+      ],
+      join(workDir, 'migrate-export.log'),
     );
+    log('export sql ok');
+
+    const sql = await Bun.file(sqlFile).text();
+    if (!sql.startsWith('-- di-framework:pglite logical export')) {
+      throw new Error('exported SQL dump is missing header');
+    }
+    if (dumpPath) {
+      await Bun.write(dumpPath, sql);
+    }
+
+    await $`mkdir -p ${toDir}`;
+    await runWasmtimeStep(
+      ctx,
+      currentComposed,
+      'import-sql',
+      'import sql ok',
+      ['--dir', `${toDir}::/data`, '--dir', `${dumpDir}::/dump`, ...dbEnv],
+      join(workDir, 'migrate-import.log'),
+    );
+    log('import sql ok');
+
+    const targetPgVersion = (
+      await Bun.file(join(toDir, 'pglite', 'data', 'PG_VERSION')).text()
+    ).trim();
+    if (targetPgVersion !== '18') {
+      throw new Error(
+        `migrated target cluster wrote PG_VERSION ${JSON.stringify(targetPgVersion)}, expected "18"`,
+      );
+    }
+    return sql;
+  } catch (error) {
+    await $`rm -rf ${join(toDir, 'pglite')}`.nothrow();
+    if (!toExisted) {
+      await $`rm -rf ${toDir}`.nothrow();
+    }
+    throw error;
+  } finally {
+    await rm(dumpDir, { recursive: true, force: true });
   }
-  return sql;
 }
 
 const PACKAGE_PROVIDER = 'package/dist/di-framework-pglite.wasm';
@@ -252,6 +324,7 @@ export const migrate17To18: Command = async (ctx, argv) => {
     previousComposed,
     currentComposed,
     workDir,
+    database: args.database,
     dumpPath: args.dumpPath,
     fromServerVersion,
   });
