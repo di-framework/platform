@@ -3,8 +3,8 @@
   "private": true,
   "type": "commonjs",
   "dependencies": {
-    "@pulumi/kubernetes": "4.34.2",
-    "@pulumi/pulumi": "3.273.0"
+    "@pulumi/kubernetes": "4.34.3",
+    "@pulumi/pulumi": "3.274.1"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
